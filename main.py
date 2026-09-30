@@ -85,7 +85,7 @@ Consignes :
 """
     try:
         response = ai_client.models.generate_content(
-            model="gemini-3.1-pro-preview",
+            model="gemini-2.5-flash",
             contents=prompt
         )
         texte = response.text
