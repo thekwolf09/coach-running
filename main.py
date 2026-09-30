@@ -6,6 +6,7 @@ import requests
 from requests.auth import HTTPBasicAuth
 from google import genai
 from telegram import Update
+from telegram.constants import ChatAction
 from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters
 
 INTERVALS_ATHLETE_ID = os.environ.get("INTERVALS_ATHLETE_ID", "0").strip() or "0"
@@ -36,7 +37,6 @@ def sauvegarder_memoire(data):
     with open(MEMORY_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
-# 1. Profil & Paramètres physiologiques de base
 def get_profil_athlete():
     try:
         r = requests.get(BASE_URL, auth=AUTH, timeout=10)
@@ -52,7 +52,6 @@ def get_profil_athlete():
         print(f"Erreur profil: {e}")
     return {}
 
-# 2. Historique des séances avec découpage complet
 def get_activites_enrichies(limit=30):
     url = f"{BASE_URL}/activities"
     oldest = (datetime.date.today() - datetime.timedelta(days=120)).isoformat()
@@ -65,7 +64,6 @@ def get_activites_enrichies(limit=30):
             activites_recentes = sorted(activites, key=lambda x: x.get('start_date_local', ''), reverse=True)
             resume = []
             for act in activites_recentes[:limit]:
-                # Conversion vitesse m/s -> min/km
                 vitesse_ms = act.get("average_speed", 0)
                 allure_str = None
                 if vitesse_ms and vitesse_ms > 0:
@@ -94,7 +92,6 @@ def get_activites_enrichies(limit=30):
         print(f"Erreur activites: {e}")
     return []
 
-# 3. Métriques de santé complètes (Sommeil, VFC, Charge, Stress)
 def get_wellness_complet(jours=21):
     today = datetime.date.today().isoformat()
     oldest = (datetime.date.today() - datetime.timedelta(days=jours)).isoformat()
@@ -130,7 +127,6 @@ def get_wellness_complet(jours=21):
         print(f"Erreur wellness: {e}")
     return []
 
-# 4. Calendrier futur (séances déjà planifiées sur Garmin/Intervals)
 def get_seances_planifiees():
     today = datetime.date.today().isoformat()
     dans_7_jours = (datetime.date.today() + datetime.timedelta(days=7)).isoformat()
@@ -145,14 +141,38 @@ def get_seances_planifiees():
         print(f"Erreur events: {e}")
     return []
 
+def appel_gemini_robuste(prompt):
+    modeles = ["gemini-3.8-flash", "gemini-2.5-flash"]
+    for model_name in modeles:
+        for attempt in range(4):
+            try:
+                response = ai_client.models.generate_content(
+                    model=model_name,
+                    contents=prompt
+                )
+                if response and response.text:
+                    return response.text
+            except Exception as e:
+                err_str = str(e)
+                # En cas de 503 (surcharge), on patiente de plus en plus longtemps
+                if "503" in err_str or "UNAVAILABLE" in err_str:
+                    wait_time = (attempt + 1) * 2  # 2s, 4s, 6s...
+                    time.sleep(wait_time)
+                    continue
+                # Si erreur autre, on tente directement le modèle suivant
+                break
+    return "Le service d'analyse est actuellement saturé côté Google. Merci de réessayer dans 30 secondes."
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != TELEGRAM_USER_ID:
         return
 
+    # Affiche le statut "en train d'écrire..." sur Telegram
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
+
     message = update.message.text
     memoire = charger_memoire()
     
-    # Récupération de l'ensemble des données
     profil = get_profil_athlete()
     activites = get_activites_enrichies(limit=30)
     sante = get_wellness_complet(jours=21)
@@ -187,33 +207,20 @@ Directives :
 3. Si l'athlète te partage une information durable (douleur, ressenti d'effort, événement, modification d'objectif), inscris-la en fin de réponse sous la forme :
 [MEMOIRE] note précise à enregistrer
 """
-    texte = None
-    for attempt in range(2):
-        try:
-            response = ai_client.models.generate_content(
-                model="gemini-3.8-flash",
-                contents=prompt
-            )
-            texte = response.text
-            break
-        except Exception as e:
-            if "503" in str(e) and attempt == 0:
-                time.sleep(2)
-                continue
-            texte = f"Erreur d'analyse : {e}"
+    texte = appel_gemini_robuste(prompt)
 
-    if texte and "[MEMOIRE]" in texte:
+    if "[MEMOIRE]" in texte:
         parts = texte.split("[MEMOIRE]")
         reponse_user = parts[0].strip()
         note = parts[1].strip().split("\n")[0]
         memoire["notes_historique"].append({"date": datetime.date.today().isoformat(), "note": note})
         sauvegarder_memoire(memoire)
         await update.message.reply_text(reponse_user)
-    elif texte:
+    else:
         await update.message.reply_text(texte)
 
 if __name__ == "__main__":
-    print("Démarrage du bot coach avec télémétrie complète Intervals.icu...")
+    print("Démarrage du bot coach avec télémétrie complète et gestion robuste des erreurs...")
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
     app.run_polling()
