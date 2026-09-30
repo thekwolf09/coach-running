@@ -159,7 +159,7 @@ def appel_gemini_robuste(prompt):
                     time.sleep(wait_time)
                     continue
                 break
-    return "Service temporairement indisponible. Réessaie dans quelques secondes."
+    return "Service temporairement indisponible côté Google. Réessaie dans un instant."
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != TELEGRAM_USER_ID:
@@ -197,16 +197,15 @@ SÉANCES PLANIFIÉES (7 prochains jours) :
 MESSAGE DE L'ATHLÈTE :
 "{message}"
 
-RÈGLES STRICTES DE MISE EN FORME TELEGRAM :
-- La lecture sur smartphone doit être aérée, percutante et agréable.
-- INTERDIT d'utiliser des dièses (pas de #, ## ou ###). Utilise à la place du texte en GRAS propre et des sauts de ligne.
-- Ne fais jamais de longs pavés de texte. Découpe en courts paragraphes de 2-3 lignes max.
-- Utilise des tirets simples `-` pour les listes. Pas d'étoiles doubles au milieu de tirets.
-- Structure ta réponse en 3 temps maximum :
-  1. Le constat chiffré direct (faits et métriques clés).
-  2. L'analyse physiologique concise (pourquoi c'est comme ça).
-  3. La recommandation / plan d'action immédiat.
-- Si une information durable est partagée par l'athlète, écris en fin de réponse :
+CONSIGNES STRICTES DE FORMATAGE (FORMAT HTML OBLIGATOIRE) :
+- N'utilise PAS de Markdown (*, **, #). Utilise STRICTEMENT des balises HTML supportées par Telegram :
+  • <b>Texte en gras</b> pour mettre en valeur les titres, allures et métriques clés.
+  • <i>Texte en italique</i> pour les précisions physiologiques.
+  • <code>code ou chiffre clé</code> si utile.
+- Rends le message TRÈS AÉRÉ et visuel avec de vrais sauts de ligne (laisse une ligne vide entre chaque point).
+- Utilise des émojis discrets en tête de section (ex: 📊 pour l'état des lieux, 🫀 pour la physiologie/récupération, 🎯 pour les conseils concrets/séance suivante).
+- Style direct, percutant, zéro remplissage.
+- Si une information durable est partagée par l'athlète, écris en toute fin :
 [MEMOIRE] note précise à enregistrer
 """
     texte = appel_gemini_robuste(prompt)
@@ -219,14 +218,15 @@ RÈGLES STRICTES DE MISE EN FORME TELEGRAM :
         memoire["notes_historique"].append({"date": datetime.date.today().isoformat(), "note": note})
         sauvegarder_memoire(memoire)
 
-    # Envoi sécurisé en mode Markdown (avec repli en texte brut si formatage exotique)
+    # Envoi direct en HTML Telegram
     try:
-        await update.message.reply_text(reponse_user, parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text(reponse_user, parse_mode=ParseMode.HTML)
     except Exception:
+        # Repli si une balise HTML était mal fermée
         await update.message.reply_text(reponse_user)
 
 if __name__ == "__main__":
-    print("Démarrage du bot coach avec affichage optimisé pour mobile...")
+    print("Démarrage du bot coach avec formatage HTML natif...")
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
     app.run_polling()
