@@ -1,4 +1,4 @@
-import os
+csjimport os
 import io
 import json
 import time
@@ -90,9 +90,9 @@ def fetch_profil_athlete():
             d = r.json()
             return {
                 "zones_fc": d.get("icu_hr_zones"),
-                "fc_max_enregistree": d.get("icu_resting_hr"),
-                "seuil_lactique_lthr": d.get("icu_lthr"),
-                "poids_reference": d.get("weight")
+                "fc_max": d.get("icu_resting_hr"),
+                "seuil_lthr": d.get("icu_lthr"),
+                "poids": d.get("weight")
             }
     except Exception:
         pass
@@ -111,14 +111,14 @@ def fetch_wellness_complet():
                     if j.get("sleepSecs") or j.get("hrv") or j.get("ctl"):
                         res.append({
                             "date": j.get("id"),
-                            "sommeil_heures": round(j.get("sleepSecs", 0) / 3600, 1) if j.get("sleepSecs") else None,
+                            "sommeil_h": round(j.get("sleepSecs", 0) / 3600, 1) if j.get("sleepSecs") else None,
                             "score_sommeil": j.get("sleepScore"),
-                            "vfc_rmssd": j.get("hrv"),
-                            "vfc_baseline": j.get("hrvBaseline"),
+                            "vfc": j.get("hrv"),
+                            "vfc_base": j.get("hrvBaseline"),
                             "fc_repos": j.get("restingHR"),
-                            "forme_tsb": j.get("form"),
-                            "fatigue_aigue_atl": j.get("atl"),
-                            "condition_physique_ctl": j.get("ctl")
+                            "tsb": j.get("form"),
+                            "atl": j.get("atl"),
+                            "ctl": j.get("ctl")
                         })
                 return res
     except Exception:
@@ -142,11 +142,11 @@ def fetch_activites_enrichies():
                         "nom": act.get("name"),
                         "km": round(act.get("distance", 0) / 1000, 2),
                         "duree_min": round(act.get("moving_time", 0) / 60, 1),
-                        "allure_moyenne": allure,
-                        "fc_moyenne": act.get("average_heartrate"),
+                        "allure": allure,
+                        "fc_moy": act.get("average_heartrate"),
                         "fc_max": act.get("max_heartrate"),
-                        "charge_icu": act.get("icu_training_load"),
-                        "decouplage_pct": act.get("icu_decoupling")
+                        "charge": act.get("icu_training_load"),
+                        "decouplage": act.get("icu_decoupling")
                     })
                 return res
     except Exception:
@@ -234,6 +234,110 @@ MÉMOIRE DURABLE (Base SQLite) :
 
 PHYSIOLOGIE SUR 6 MOIS (Sommeil, VFC rMSSD vs Baseline, FC repos, ATL, CTL, TSB) :
 {json.dumps(sante, ensure_ascii=False)}
+
+SÉANCES SUR 6 MOIS (Allures, FC, Découplage, Charge) :
+{json.dumps(activites, ensure_ascii=False)}
+
+PLAN SUR 13 SEMAINES (Cycle complet du calendrier) :
+{json.dumps(planifiees, ensure_ascii=False)}
+
+DIRECTIVES :
+1. Analyse croisée : 6 mois passés + nuit/forme du jour + 13 semaines à venir.
+2. FORMAT HTML TELEGRAM : <b>Texte en gras</b> pour les titres et allures, lignes vides entre chaque point, émojis sobres (📊, 🫀, 🎯). Pas de dièses (#) ni d'astérisques (**).
+3. Si un fait durable est mentionné, écris en fin de message :
+[MEMOIRE] note à enregistrer
+"""
+
+async def envoyer_reponse(chat_id, texte, bot):
+    if "[MEMOIRE]" in texte:
+        parts = texte.split("[MEMOIRE]")
+        reponse_user = parts[0].strip()
+        note = parts[1].strip().split("\n")[0]
+        save_memory_note(note)
+    else:
+        reponse_user = texte
+
+    try:
+        await bot.send_message(chat_id=chat_id, text=reponse_user, parse_mode=ParseMode.HTML)
+    except Exception:
+        await bot.send_message(chat_id=chat_id, text=reponse_user)
+
+async def handle_message_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != TELEGRAM_USER_ID:
+        return
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
+    try:
+        profil, sante, activites, planifiees = get_toutes_les_donnees()
+        contexte = construire_contexte_global(profil, sante, activites, planifiees)
+        prompt = f'{contexte}\n\nMESSAGE ATHLÈTE :\n"{update.message.text}"'
+        texte = generer_analyse(prompt, [modifier_ou_creer_seance])
+        await envoyer_reponse(update.effective_chat.id, texte, context.bot)
+    except Exception as e:
+        await update.message.reply_text(f"⚠️ Erreur : {e}")
+
+async def handle_message_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != TELEGRAM_USER_ID:
+        return
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.RECORD_VOICE)
+    try:
+        voice = update.message.voice or update.message.audio
+        file = await context.bot.get_file(voice.file_id)
+        audio_buffer = io.BytesIO()
+        await file.download_to_memory(audio_buffer)
+        audio_bytes = audio_buffer.getvalue()
+
+        profil, sante, activites, planifiees = get_toutes_les_donnees()
+        contexte = construire_contexte_global(profil, sante, activites, planifiees)
+        prompt_parts = [
+            contexte,
+            types.Part.from_bytes(data=audio_bytes, mime_type="audio/ogg"),
+            "Message vocal de l'athlète. Analyse ses propos et réponds-lui avec précision."
+        ]
+        texte = generer_analyse(prompt_parts, [modifier_ou_creer_seance])
+        await envoyer_reponse(update.effective_chat.id, texte, context.bot)
+    except Exception as e:
+        await update.message.reply_text(f"⚠️ Erreur vocale : {e}")
+
+def background_surveillance_worker():
+    time.sleep(30)
+    send_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    while True:
+        try:
+            profil, sante, activites, planifiees = get_toutes_les_donnees()
+            if activites:
+                derniere = activites[0]
+                act_id = str(derniere.get("id"))
+                if not is_activity_processed(act_id):
+                    mark_activity_processed(act_id)
+                    contexte = construire_contexte_global(profil, sante, activites, planifiees)
+                    prompt = f"{contexte}\n\nÉVÉNEMENT PROACTIF : Nouvelle séance détectée !\n{json.dumps(derniere, ensure_ascii=False)}\nDébriefe cette séance."
+                    texte = generer_analyse(prompt)
+                    requests.post(send_url, json={"chat_id": TELEGRAM_USER_ID, "text": f"🏁 <b>Nouvelle séance détectée !</b>\n\n{texte}", "parse_mode": "HTML"}, timeout=10)
+
+            if sante:
+                derniere_sante = sante[0]
+                date_nuit = derniere_sante.get("date")
+                sommeil = derniere_sante.get("sommeil_h")
+                if date_nuit and sommeil and sommeil > 0 and not is_wellness_processed(date_nuit):
+                    mark_wellness_processed(date_nuit)
+                    contexte = construire_contexte_global(profil, sante, activites, planifiees)
+                    prompt = f"{contexte}\n\nÉVÉNEMENT PROACTIF : Réveil ({date_nuit}). Données enregistrées :\n{json.dumps(derniere_sante, ensure_ascii=False)}\nBrief matinal."
+                    texte = generer_analyse(prompt)
+                    requests.post(send_url, json={"chat_id": TELEGRAM_USER_ID, "text": f"☀️ <b>Réveil détecté · Métriques physiologiques</b>\n\n{texte}", "parse_mode": "HTML"}, timeout=10)
+        except Exception:
+            pass
+        time.sleep(900)
+
+if __name__ == "__main__":
+    init_db()
+    print("Démarrage du bot coach...")
+    t = threading.Thread(target=background_surveillance_worker, daemon=True)
+    t.start()
+    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message_text))
+    app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_message_voice))
+    app.run_polling()
+re_ascii=False)}
 
 SÉANCES SUR 6 MOIS (Allures, FC, Découplage, Charge) :
 {json.dumps(activites, ensure_ascii=False)}
