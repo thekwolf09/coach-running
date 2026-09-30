@@ -39,6 +39,7 @@ def init_db():
     c.execute("CREATE TABLE IF NOT EXISTS seen_acts (id TEXT PRIMARY KEY)")
     c.execute("CREATE TABLE IF NOT EXISTS seen_well (d TEXT PRIMARY KEY)")
     c.execute("CREATE TABLE IF NOT EXISTS chat_history (id INTEGER PRIMARY KEY AUTOINCREMENT, role TEXT, txt TEXT, d TEXT)")
+    c.execute("CREATE TABLE IF NOT EXISTS seen_reports (id TEXT PRIMARY KEY)")
     conn.commit()
     conn.close()
 
@@ -86,7 +87,7 @@ def fetch_profile():
                 "timezone": d.get("timezone")
             }
     except Exception as err:
-        logging.error(f"Erreur fetch_profile: {err}")
+        logging.error(f"Erreur fetch_profile : {err}")
     return {}
 
 def fetch_weather(city_name: str = ""):
@@ -123,7 +124,7 @@ def fetch_weather(city_name: str = ""):
                     "probabilite_pluie": f"{daily.get('precipitation_probability_max', ['0'])[0]}%"
                 }
     except Exception as err:
-        logging.error(f"Erreur fetch_weather: {err}")
+        logging.error(f"Erreur fetch_weather : {err}")
     return {"info": "Météo non disponible"}
 
 def fetch_wellness():
@@ -151,8 +152,43 @@ def fetch_wellness():
                     })
             return res
     except Exception as err:
-        logging.error(f"Erreur fetch_wellness: {err}")
+        logging.error(f"Erreur fetch_wellness : {err}")
     return []
+
+def evaluate_injury_risk(wellness_list):
+    if not wellness_list:
+        return {"acwr": 0.0, "alerte_surcharge": False, "alerte_vrc": False, "msg": "Données insuffisantes"}
+    
+    w0 = wellness_list[0]
+    atl = w0.get("atl") or 0
+    ctl = w0.get("ctl") or 0
+    acwr = round(atl / ctl, 2) if ctl > 0 else 0.0
+    
+    alerte_surcharge = acwr >= 1.35
+    alerte_vrc = False
+
+    if len(wellness_list) >= 2:
+        w1 = wellness_list[1]
+        base0 = w0.get("hrv_base") or 0
+        base1 = w1.get("hrv_base") or 0
+        h0 = w0.get("hrv") or 0
+        h1 = w1.get("hrv") or 0
+        if base0 > 0 and base1 > 0 and h0 < (base0 * 0.90) and h1 < (base1 * 0.90):
+            alerte_vrc = True
+
+    warnings = []
+    if alerte_surcharge:
+        warnings.append(f"ACWR élevé à {acwr} (seuil critique : 1.35)")
+    if alerte_vrc:
+        warnings.append("VRC anormalement basse deux nuits de suite sous la référence")
+
+    return {
+        "acwr": acwr,
+        "alerte_surcharge": alerte_surcharge,
+        "alerte_vrc": alerte_vrc,
+        "statut": "DANGER" if (alerte_surcharge or alerte_vrc) else "OPTIMAL",
+        "details": warnings
+    }
 
 def fetch_activities():
     today = datetime.date.today()
@@ -166,6 +202,7 @@ def fetch_activities():
             
             raw_3months = []
             older_acts = []
+            meilleures_allures = []
 
             for a in raw:
                 d_str = str(a.get("start_date_local", ""))[:10]
@@ -173,6 +210,7 @@ def fetch_activities():
                 dist = a.get("distance") or 0
                 mtime = a.get("moving_time") or 0
                 pace = f"{int((1000/spd)//60)}'{int((1000/spd)%60):02d}\"/km" if spd > 0 else None
+
                 item = {
                     "id": a.get("id"),
                     "d": d_str,
@@ -183,10 +221,20 @@ def fetch_activities():
                     "hr": a.get("average_heartrate"),
                     "load": a.get("icu_training_load")
                 }
+
+                if dist >= 3000 and spd > 0:
+                    meilleures_allures.append((spd, pace, item["km"], d_str))
+
                 if d_str >= d90:
                     raw_3months.append(item)
                 else:
                     older_acts.append(item)
+
+            meilleures_allures.sort(key=lambda x: x[0], reverse=True)
+            top_perfs = [
+                {"allure": x[1], "distance_km": x[2], "date": x[3]}
+                for x in meilleures_allures[:5]
+            ]
 
             weeks = {}
             for a in older_acts:
@@ -212,11 +260,12 @@ def fetch_activities():
 
             return {
                 "brut_3_mois": raw_3months,
-                "agregat_semaines_3_a_6_mois": weekly_summary
+                "agregat_semaines_3_a_6_mois": weekly_summary,
+                "top_performances_recentes": top_perfs
             }
     except Exception as err:
-        logging.error(f"Erreur fetch_activities: {err}")
-    return {"brut_3_mois": [], "agregat_semaines_3_a_6_mois": []}
+        logging.error(f"Erreur fetch_activities : {err}")
+    return {"brut_3_mois": [], "agregat_semaines_3_a_6_mois": [], "top_performances_recentes": []}
 
 def fetch_events():
     today = datetime.date.today()
@@ -235,7 +284,7 @@ def fetch_events():
                 "category": e.get("category")
             } for e in raw if e.get("category") == "WORKOUT"]
     except Exception as err:
-        logging.error(f"Erreur fetch_events: {err}")
+        logging.error(f"Erreur fetch_events : {err}")
     return []
 
 def get_all_data():
@@ -366,13 +415,42 @@ def deplacer_seance(date_origine: str = "", date_cible: str = "", titre: str = "
 
         ev_id = target_event.get("id")
         ev_nom = target_event.get("name", "Séance")
-        payload = {
-            "start_date_local": f"{d_dest}T{clean_hour}:00"
-        }
+        payload = {"start_date_local": f"{d_dest}T{clean_hour}:00"}
         put_r = requests.put(f"{BASE}/events/{ev_id}", auth=AUTH, json=payload, timeout=8)
         if put_r.status_code in (200, 204):
             return f"La séance '{ev_nom}' a été déplacée du {d_orig} au {d_dest} à {clean_hour}."
-        return f"Erreur lors du déplacement sur Intervals ({put_r.status_code}) : {put_r.text}"
+        return f"Erreur déplacement Intervals ({put_r.status_code}) : {put_r.text}"
+    except Exception as err:
+        return f"Erreur connexion Intervals : {err}"
+
+def gerer_indisponibilite(date_debut: str = "", date_fin: str = "", motif: str = "Repos forcé", **kwargs) -> str:
+    """Annule les séances d'entraînement sur une plage de dates en cas d'imprévu, maladie ou déplacement.
+    Args:
+        date_debut: Date de début au format AAAA-MM-JJ (ou 'today').
+        date_fin: Date de fin au format AAAA-MM-JJ (ou 'dimanche').
+        motif: Cause (ex: 'grippe', 'déplacement pro', 'coup de fatigue').
+    """
+    d1 = parse_relative_date(date_debut or datetime.date.today().isoformat())
+    d2 = parse_relative_date(date_fin or d1)
+    if d1 > d2:
+        d1, d2 = d2, d1
+
+    try:
+        r = requests.get(f"{BASE}/events", auth=AUTH, params={"oldest": d1, "newest": d2}, timeout=10)
+        if r.status_code != 200:
+            return f"Impossible de lire le calendrier ({r.status_code})."
+
+        events = [e for e in r.json() if e.get("category") == "WORKOUT"]
+        if not events:
+            return f"Aucune séance programmée entre le {d1} et le {d2}."
+
+        supprimees = []
+        for ev in events:
+            del_r = requests.delete(f"{BASE}/events/{ev['id']}", auth=AUTH, timeout=8)
+            if del_r.status_code in (200, 204):
+                supprimees.append(ev.get("name", "Séance"))
+
+        return f"{len(supprimees)} séance(s) supprimée(s) du {d1} au {d2} pour motif '{motif}' : {', '.join(supprimees)}."
     except Exception as err:
         return f"Erreur connexion Intervals : {err}"
 
@@ -380,11 +458,12 @@ def generate_ai(prompt_parts, user_msg_raw=""):
     tools_map = {
         "planifier_seance": planifier_seance,
         "supprimer_seance": supprimer_seance,
-        "deplacer_seance": deplacer_seance
+        "deplacer_seance": deplacer_seance,
+        "gerer_indisponibilite": gerer_indisponibilite
     }
     dernier_bug = ""
     cfg = types.GenerateContentConfig(
-        tools=[planifier_seance, supprimer_seance, deplacer_seance],
+        tools=[planifier_seance, supprimer_seance, deplacer_seance, gerer_indisponibilite],
         temperature=0.3
     )
 
@@ -397,63 +476,4 @@ def generate_ai(prompt_parts, user_msg_raw=""):
                 args = dict(call.args) if call.args else {}
                 tool_res = fn(**args) if fn else "Action inconnue"
                 time.sleep(1)
-                conf_prompt = (
-                    f"Action exécutée : {tool_res}.\n"
-                    f"Demande initiale : '{user_msg_raw}'.\n"
-                    f"Confirme à l'athlète en HTML Telegram avec un ton direct et bienveillant."
-                )
-                r_conf = ai_client.models.generate_content(model=MODEL_NAME, contents=conf_prompt)
-                return r_conf.text
-            if r and r.text:
-                return r.text
-        except Exception as e:
-            dernier_bug = str(e)
-            logging.error(f"Erreur generate_ai: {e}")
-            if "429" in dernier_bug or "RESOURCE_EXHAUSTED" in dernier_bug:
-                time.sleep(3)
-                continue
-            time.sleep(1.5)
-
-    return f"⚠️ Erreur détaillée : {dernier_bug}"
-
-def make_prompt(prof, weather, well, acts, evts, user_msg):
-    mem = get_notes()
-    chat_hist = get_chat_history(6)
-
-    today_str = datetime.date.today().isoformat()
-    consignes = (
-        "Consignes d'entraînement et d'analyse :\n"
-        "1. Contexte temporel : les listes récentes sont triées de la plus récente à la plus ancienne. "
-        "Les agrégats 3-6 mois te permettent de comparer le niveau actuel avec les cycles précédents.\n"
-        "2. Météo : tiens compte de la météo pour conseiller l'horaire de course ou adapter l'allure si forte chaleur ou vent.\n"
-        "3. HISTORIQUE DE CONVERSATION : sers-toi des derniers messages échangés pour comprendre les pronoms "
-        "('celle-ci', 'la séance', 'demain').\n"
-        "4. OUTILS CALENDRIER : si l'athlète demande d'ajouter, décaler ou supprimer une séance, appelle "
-        "obligatoirement planifier_seance, deplacer_seance ou supprimer_seance.\n"
-        "5. FORMAT HTML TELEGRAM : utilise <b>Texte en gras</b> pour les chiffres clés et allures. "
-        "Aère avec des lignes vides. Pas de Markdown (# ou **).\n"
-        "6. Si un fait durable est mentionné, écris en fin de message : [MEMOIRE] note à enregistrer"
-    )
-
-    return (
-        f"Tu es l'entraîneur d'athlétisme personnel de ce coureur (objectif prioritaire : 5 km sub-20, cible 3'59/km au 13/12/2026).\n"
-        f"Date du jour : {today_str}.\n\n"
-        f"MÉTÉO DU JOUR : {json.dumps(weather, ensure_ascii=False)}\n"
-        f"PROFIL ATHLÈTE : {json.dumps(prof, ensure_ascii=False)}\n"
-        f"HISTORIQUE RÉCENT CONVERSATION : {json.dumps(chat_hist, ensure_ascii=False)}\n"
-        f"MÉMOIRE DURABLE (Notes clés) : {json.dumps(mem, ensure_ascii=False)}\n"
-        f"SANTÉ 3 DERNIERS MOIS (brut) : {json.dumps(well, ensure_ascii=False)}\n"
-        f"ACTIVITÉS 3 DERNIERS MOIS (brut) : {json.dumps(acts.get('brut_3_mois', []), ensure_ascii=False)}\n"
-        f"ACTIVITÉS 3 À 6 MOIS (agrégats hebdo) : {json.dumps(acts.get('agregat_semaines_3_a_6_mois', []), ensure_ascii=False)}\n"
-        f"CALENDRIER (programmes passés 6 mois + prévisionnel 3 mois) : {json.dumps(evts, ensure_ascii=False)}\n\n"
-        f"{consignes}\n\n"
-        f"MESSAGE DE L'ATHLÈTE :\n\"{user_msg}\""
-    )
-
-async def send_reply(cid, text, bot):
-    if "[MEMOIRE]" in text:
-        parts = text.split("[MEMOIRE]")
-        text = parts[0].strip()
-        save_note(parts[1].strip().split("\n")[0])
-    
-    save_chat_msg("coach", text)
+                conf_prompt 
