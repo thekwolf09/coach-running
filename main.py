@@ -135,33 +135,33 @@ def get_all_data():
     f4 = POOL.submit(fetch_events)
     return f1.result(), f2.result(), f3.result(), f4.result()
 
-def planifier_seance(date_str: str, titre: str, description: str = "") -> str:
-    """Planifie une séance d'entraînement de course à pied sur Intervals.icu.
-    Args:
-        date_str: Date de la séance au format AAAA-MM-JJ (ex: '2026-09-30').
-        titre: Titre court de la séance.
-        description: Consignes d'allures, intensités et zones.
-    """
-    headers = {"Content-Type": "application/json"}
-    today_iso = datetime.date.today().isoformat()
-    target_date = today_iso if any(k in str(date_str).lower() for k in ["today", "aujourd", "soir"]) else str(date_str).split("T")[0]
+def planifier_seance(date_str: str = "", titre: str = "", description: str = "", **kwargs) -> str:
+    """Planifie une séance d'entraînement de course à pied sur Intervals.icu."""
+    d_val = date_str or kwargs.get("date") or kwargs.get("start_date") or datetime.date.today().isoformat()
+    t_val = titre or kwargs.get("title") or kwargs.get("name") or kwargs.get("titre_seance") or "Séance Course"
+    desc_val = description or kwargs.get("desc") or kwargs.get("details") or f"Séance : {t_val}"
 
+    today_iso = datetime.date.today().isoformat()
+    target_date = today_iso if any(k in str(d_val).lower() for k in ["today", "aujourd", "soir", "ce soir"]) else str(d_val).split("T")[0]
+
+    headers = {"Content-Type": "application/json"}
     payload = {
         "category": "WORKOUT",
         "type": "Run",
-        "name": titre,
-        "description": description or f"Séance : {titre}",
+        "name": t_val,
+        "description": desc_val,
         "start_date_local": f"{target_date}T18:00:00"
     }
     try:
         r = requests.post(f"{BASE}/events", auth=AUTH, headers=headers, json=payload, timeout=8)
         if r.status_code in (200, 201):
-            return f"Séance '{titre}' bien enregistrée sur Intervals.icu le {target_date}."
-        return f"Erreur retour Intervals ({r.status_code})"
+            return f"Séance '{t_val}' bien enregistrée sur Intervals.icu pour le {target_date}."
+        return f"Erreur Intervals.icu ({r.status_code}) : {r.text}"
     except Exception as err:
         return f"Erreur de connexion Intervals : {err}"
 
 def generate_ai(prompt_parts, user_msg_raw=""):
+    dernier_bug = ""
     for _ in range(3):
         try:
             cfg = types.GenerateContentConfig(tools=[planifier_seance], temperature=0.3)
@@ -170,24 +170,21 @@ def generate_ai(prompt_parts, user_msg_raw=""):
                 call = r.function_calls[0]
                 args = dict(call.args) if call.args else {}
                 t_res = planifier_seance(**args)
-                time.sleep(2)
+                time.sleep(1)
                 conf_prompt = (
                     f"Action exécutée : {t_res}.\n"
-                    f"Demande initiale de l'athlète : '{user_msg_raw}'.\n"
-                    f"Confirme à l'athlète en format HTML Telegram (utilise <b>Texte en gras</b> pour les allures) "
-                    f"avec un court conseil d'allure pour cette séance."
+                    f"Demande de l'athlète : '{user_msg_raw}'.\n"
+                    f"Confirme à l'athlète en HTML Telegram avec un court conseil d'allure."
                 )
                 r_conf = ai_client.models.generate_content(model="gemini-3.8-flash", contents=conf_prompt)
                 return r_conf.text
             if r and r.text:
                 return r.text
         except Exception as e:
-            err_str = str(e)
-            if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
-                time.sleep(3)
-                continue
-            time.sleep(2)
-    return "Google a temporairement saturé, réessaie dans 5 secondes."
+            dernier_bug = str(e)
+            time.sleep(1.5)
+            continue
+    return f"⚠️ Erreur interne : {dernier_bug}"
 
 def make_prompt(prof, well, acts, evts, user_msg):
     mem = get_notes()
@@ -248,7 +245,6 @@ def bg_loop():
     time.sleep(15)
     url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
 
-    # Enregistrement silencieux au boot pour ne pas déclencher d'appels simultanés
     try:
         _, well_init, acts_init, _ = get_all_data()
         conn = sqlite3.connect(DB)
@@ -299,4 +295,4 @@ if __name__ == "__main__":
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_text))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))
     app.run_polling()
-                
+    
