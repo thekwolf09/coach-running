@@ -1039,4 +1039,3 @@ if __name__ == "__main__":
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))
     app.add_error_handler(on_error)
     app.run_polling(drop_pending_updates=True)
-- 
