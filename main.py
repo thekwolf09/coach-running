@@ -337,7 +337,7 @@ if __name__ == "__main__":
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message_text))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_message_voice))
     app.run_polling()
-re_ascii=False)}
+ensure_ascii=False
 
 SÉANCES SUR 6 MOIS (Allures, FC, Découplage, Charge) :
 {json.dumps(activites, ensure_ascii=False)}
