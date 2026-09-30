@@ -478,4 +478,156 @@ def generate_ai(prompt_parts, user_msg_raw=""):
     return f"⚠️ Erreur détaillée : {dernier_bug}"
 
 def make_prompt(prof, weather, well, acts, evts, user_msg):
-    m
+    mem = get_notes()
+    chat_hist = get_chat_history(6)
+    injury_audit = evaluate_injury_risk(well)
+
+    today_str = datetime.date.today().isoformat()
+    consignes = (
+        "Consignes de coaching et d'analyse :\n"
+        "1. Contexte : les listes d'activités et de santé sont triées du plus récent au plus ancien.\n"
+        "2. VIGILANCE BLESSURE (ACWR) : si le statut ci-dessous est 'DANGER', alerte fermement l'athlète et "
+        "adapte l'intensité vers le bas ou conseille du repos.\n"
+        "3. HISTORIQUE & OUTILS : sers-toi du fil de discussion pour comprendre le contexte immédiat. "
+        "Appelle l'outil approprié pour toute modification de séance (planifier_seance, deplacer_seance, "
+        "supprimer_seance, gerer_indisponibilite).\n"
+        "4. FORMAT HTML TELEGRAM : utilise <b>Texte en gras</b> pour les chiffres et allures. "
+        "Aère avec des lignes vides. Zéro balise Markdown (# ou **).\n"
+        "5. Si un fait durable est mentionné, écris en fin de message : [MEMOIRE] note à enregistrer"
+    )
+
+    return (
+        f"Tu es l'entraîneur d'athlétisme personnel de ce coureur (objectif prioritaire : 5 km sub-20, cible 3'59/km au 13/12/2026).\n"
+        f"Date du jour : {today_str}.\n\n"
+        f"SURVEILLANCE SURCHARGE & ACWR : {json.dumps(injury_audit, ensure_ascii=False)}\n"
+        f"MÉTÉO DU JOUR : {json.dumps(weather, ensure_ascii=False)}\n"
+        f"PROFIL ATHLÈTE : {json.dumps(prof, ensure_ascii=False)}\n"
+        f"HISTORIQUE RÉCENT CONVERSATION : {json.dumps(chat_hist, ensure_ascii=False)}\n"
+        f"MÉMOIRE DURABLE (Notes clés) : {json.dumps(mem, ensure_ascii=False)}\n"
+        f"SANTÉ 3 DERNIERS MOIS (brut) : {json.dumps(well, ensure_ascii=False)}\n"
+        f"ACTIVITÉS 3 DERNIERS MOIS (brut) : {json.dumps(acts.get('brut_3_mois', []), ensure_ascii=False)}\n"
+        f"PERFORMANCES ALLURES RÉCENTES : {json.dumps(acts.get('top_performances_recentes', []), ensure_ascii=False)}\n"
+        f"ACTIVITÉS 3 À 6 MOIS (agrégats hebdo) : {json.dumps(acts.get('agregat_semaines_3_a_6_mois', []), ensure_ascii=False)}\n"
+        f"CALENDRIER (programmes passés 6 mois + prévisionnel 3 mois) : {json.dumps(evts, ensure_ascii=False)}\n\n"
+        f"{consignes}\n\n"
+        f"MESSAGE DE L'ATHLÈTE :\n\"{user_msg}\""
+    )
+
+async def send_reply(cid, text, bot):
+    if "[MEMOIRE]" in text:
+        parts = text.split("[MEMOIRE]")
+        text = parts[0].strip()
+        save_note(parts[1].strip().split("\n")[0])
+    
+    save_chat_msg("coach", text)
+    try:
+        await bot.send_message(chat_id=cid, text=text, parse_mode=ParseMode.HTML)
+    except Exception:
+        clean_text = re.sub(r'<[^>]+>', '', text)
+        await bot.send_message(chat_id=cid, text=clean_text)
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != TG_USER:
+        return
+    msg = update.message.text
+    save_chat_msg("athlete", msg)
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
+    
+    prof, weather, well, acts, evts = await asyncio.to_thread(get_all_data)
+    prompt = make_prompt(prof, weather, well, acts, evts, msg)
+    ans = await asyncio.to_thread(generate_ai, prompt, user_msg_raw=msg)
+    await send_reply(update.effective_chat.id, ans, context.bot)
+
+async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != TG_USER:
+        return
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.RECORD_VOICE)
+    v = update.message.voice or update.message.audio
+    f = await context.bot.get_file(v.file_id)
+    buf = io.BytesIO()
+    await f.download_to_memory(buf)
+    mime = getattr(v, "mime_type", None) or "audio/ogg"
+
+    save_chat_msg("athlete", "[Message Vocal]")
+    prof, weather, well, acts, evts = await asyncio.to_thread(get_all_data)
+    prompt = [
+        make_prompt(prof, weather, well, acts, evts, "Message vocal reçu de l'athlète"),
+        types.Part.from_bytes(data=buf.getvalue(), mime_type=mime)
+    ]
+    ans = await asyncio.to_thread(generate_ai, prompt, user_msg_raw="Message vocal")
+    await send_reply(update.effective_chat.id, ans, context.bot)
+
+def bg_loop():
+    time.sleep(20)
+    url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
+
+    try:
+        _, _, well_init, acts_init, _ = get_all_data()
+        conn = sqlite3.connect(DB)
+        c = conn.cursor()
+        for a in acts_init.get("brut_3_mois", []):
+            c.execute("INSERT OR IGNORE INTO seen_acts VALUES (?)", (str(a["id"]),))
+        if well_init and well_init[0].get("d"):
+            c.execute("INSERT OR IGNORE INTO seen_well VALUES (?)", (str(well_init[0]["d"]),))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logging.error(f"Erreur init bg_loop : {e}")
+
+    while True:
+        time.sleep(900)
+        try:
+            prof, weather, well, acts, evts = get_all_data()
+            conn = sqlite3.connect(DB)
+            c = conn.cursor()
+
+            brut_acts = acts.get("brut_3_mois", [])
+            if brut_acts:
+                for a in brut_acts:
+                    act_id = str(a["id"])
+                    c.execute("SELECT 1 FROM seen_acts WHERE id=?", (act_id,))
+                    if not c.fetchone():
+                        c.execute("INSERT OR IGNORE INTO seen_acts VALUES (?)", (act_id,))
+                        conn.commit()
+                        ans = generate_ai(make_prompt(prof, weather, well, acts, evts, f"Débrief séance terminée : {a}"))
+                        save_chat_msg("coach", f"[Débrief auto] {ans}")
+                        requests.post(url, json={"chat_id": TG_USER, "text": f"🏁 <b>Nouvelle séance détectée !</b>\n\n{ans}", "parse_mode": "HTML"}, timeout=10)
+
+            if well and well[0].get("d") and well[0].get("sleep_h"):
+                last_d = well[0]["d"]
+                c.execute("SELECT 1 FROM seen_well WHERE d=?", (last_d,))
+                if not c.fetchone():
+                    c.execute("INSERT OR IGNORE INTO seen_well VALUES (?)", (last_d,))
+                    conn.commit()
+                    ans = generate_ai(make_prompt(prof, weather, well, acts, evts, f"Brief réveil : {well[0]}"))
+                    save_chat_msg("coach", f"[Brief auto] {ans}")
+                    requests.post(url, json={"chat_id": TG_USER, "text": f"☀️ <b>Réveil détecté</b>\n\n{ans}", "parse_mode": "HTML"}, timeout=10)
+
+            now = datetime.datetime.now()
+            if now.weekday() == 6 and now.hour >= 19:
+                week_id = f"bilan_{now.isocalendar()[0]}_{now.isocalendar()[1]}"
+                c.execute("SELECT 1 FROM seen_reports WHERE id=?", (week_id,))
+                if not c.fetchone():
+                    c.execute("INSERT OR IGNORE INTO seen_reports VALUES (?)", (week_id,))
+                    conn.commit()
+                    prompt_bilan = make_prompt(
+                        prof, weather, well, acts, evts,
+                        "C'est dimanche soir. Rédige le BILAN HEBDOMADAIRE complet : "
+                        "volume en km réalisé vs prévu, charge, fatigue, et présente les 3 séances clés de la semaine à venir."
+                    )
+                    ans_bilan = generate_ai(prompt_bilan, user_msg_raw="Bilan hebdo automatique")
+                    save_chat_msg("coach", f"[Bilan Hebdo] {ans_bilan}")
+                    requests.post(url, json={"chat_id": TG_USER, "text": f"📊 <b>Bilan hebdomadaire du Coach</b>\n\n{ans_bilan}", "parse_mode": "HTML"}, timeout=10)
+
+            conn.close()
+        except Exception as e:
+            logging.error(f"Erreur boucle bg_loop : {e}")
+
+if __name__ == "__main__":
+    init_db()
+    logging.info("Bot Coach Running démarré avec succès !")
+    threading.Thread(target=bg_loop, daemon=True).start()
+    app = ApplicationBuilder().token(TG_TOKEN).build()
+    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_text))
+    app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))
+    app.run_polling()
