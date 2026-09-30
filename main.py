@@ -1,5 +1,6 @@
 import os
 import json
+import time
 import datetime
 import requests
 from requests.auth import HTTPBasicAuth
@@ -7,10 +8,7 @@ from google import genai
 from telegram import Update
 from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters
 
-INTERVALS_ATHLETE_ID = os.environ.get("INTERVALS_ATHLETE_ID", "0").strip()
-if not INTERVALS_ATHLETE_ID:
-    INTERVALS_ATHLETE_ID = "0"
-
+INTERVALS_ATHLETE_ID = os.environ.get("INTERVALS_ATHLETE_ID", "0").strip() or "0"
 INTERVALS_API_KEY = os.environ.get("INTERVALS_API_KEY", "").strip()
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
@@ -35,20 +33,16 @@ def sauvegarder_memoire(data):
     with open(MEMORY_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
-def get_dernieres_activites(limit=5):
-    # L'ID '0' est le raccourci officiel Intervals.icu pour l'athlète lié à la clé
-    athlete_id = INTERVALS_ATHLETE_ID if INTERVALS_ATHLETE_ID != "0" else "0"
-    url = f"https://intervals.icu/api/v1/athlete/{athlete_id}/activities"
-    
-    # Authentification HTTP Basic : username='API_KEY', password=ta_cle
+def get_dernieres_activites(limit=30):
+    url = f"https://intervals.icu/api/v1/athlete/{INTERVALS_ATHLETE_ID}/activities"
     auth = HTTPBasicAuth("API_KEY", INTERVALS_API_KEY)
     
-    # Recherche large sur les 90 derniers jours sans date de fin stricte
-    oldest = (datetime.date.today() - datetime.timedelta(days=90)).isoformat()
+    # Historique élargi aux 120 derniers jours (4 mois)
+    oldest = (datetime.date.today() - datetime.timedelta(days=120)).isoformat()
     params = {"oldest": oldest}
     
     try:
-        r = requests.get(url, auth=auth, params=params, timeout=10)
+        r = requests.get(url, auth=auth, params=params, timeout=15)
         if r.status_code == 200:
             activites = r.json()
             if not isinstance(activites, list):
@@ -57,7 +51,7 @@ def get_dernieres_activites(limit=5):
             resume = []
             for act in activites_recentes[:limit]:
                 resume.append({
-                    "date": act.get("start_date_local"),
+                    "date": act.get("start_date_local", "")[:10],
                     "nom": act.get("name"),
                     "type": act.get("type"),
                     "distance_km": round(act.get("distance", 0) / 1000, 2),
@@ -68,10 +62,8 @@ def get_dernieres_activites(limit=5):
                 })
             return resume
         else:
-            print(f"Erreur API Intervals : status {r.status_code} - {r.text}")
-            return [{"erreur_intervals": f"Code HTTP {r.status_code}: {r.text}"}]
+            return [{"erreur_intervals": f"Code HTTP {r.status_code}"}]
     except Exception as e:
-        print(f"Erreur connexion Intervals: {e}")
         return [{"erreur_connexion": str(e)}]
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -80,44 +72,52 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     message = update.message.text
     memoire = charger_memoire()
-    activites = get_dernieres_activites()
+    # Récupère jusqu'aux 30 dernières séances
+    activites = get_dernieres_activites(limit=30)
 
     prompt = f"""Tu es un entraîneur d'athlétisme expert en course de fond (approche polarisée 80/20, gestion fine du seuil LT2 et de la charge).
 Analyse les retours de l'athlète avec rigueur, franchise et précision chiffrée. Pas de blabla inutile.
 
-PROFIL :
+PROFIL DU COUREUR :
 {memoire['profil']}
-Dernières notes clés : {json.dumps(memoire['notes_historique'][-5:], ensure_ascii=False)}
+Dernières notes clés conservées en mémoire : {json.dumps(memoire['notes_historique'][-10:], ensure_ascii=False)}
 
-DERNIÈRES SÉANCES DÉTECTÉES SUR INTERVALS.ICU :
+HISTORIQUE DES SÉANCES (jusqu'à 30 séances sur 4 mois) :
 {json.dumps(activites, ensure_ascii=False, indent=2)}
 
 MESSAGE DE L'ATHLÈTE :
 "{message}"
 
 Consignes :
-1. Si des activités sont présentes dans le JSON, analyse-les précisément.
-2. Si une erreur technique apparaît dans le JSON (ex: 'erreur_intervals'), signale-la clairement.
-3. Si une nouvelle information clé apparaît (blessure, sensation, chrono test), ajoute à la fin de ta réponse une ligne sous la forme :
+1. Analyse les tendances de fond sur les semaines et mois disponibles (progression du volume, allure en endurance, dérives cardiaques, charge cumulée).
+2. Si une nouvelle information clé apparaît (blessure, ressenti marquant, nouveau test chrono), ajoute à la fin de ta réponse une ligne sous la forme :
 [MEMOIRE] information à retenir
 """
-    try:
-        response = ai_client.models.generate_content(
-            model="gemini-3.8-flash",
-            contents=prompt
-        )
-        texte = response.text
-        if "[MEMOIRE]" in texte:
-            parts = texte.split("[MEMOIRE]")
-            reponse_user = parts[0].strip()
-            note = parts[1].strip().split("\n")[0]
-            memoire["notes_historique"].append({"date": datetime.date.today().isoformat(), "note": note})
-            sauvegarder_memoire(memoire)
-            await update.message.reply_text(reponse_user)
-        else:
-            await update.message.reply_text(texte)
-    except Exception as e:
-        await update.message.reply_text(f"Erreur d'analyse : {e}")
+    # Gestion automatique des erreurs 503 avec 2 tentatives
+    texte = None
+    for attempt in range(2):
+        try:
+            response = ai_client.models.generate_content(
+                model="gemini-3.8-flash",
+                contents=prompt
+            )
+            texte = response.text
+            break
+        except Exception as e:
+            if "503" in str(e) and attempt == 0:
+                time.sleep(2)
+                continue
+            texte = f"Erreur d'analyse : {e}"
+
+    if texte and "[MEMOIRE]" in texte:
+        parts = texte.split("[MEMOIRE]")
+        reponse_user = parts[0].strip()
+        note = parts[1].strip().split("\n")[0]
+        memoire["notes_historique"].append({"date": datetime.date.today().isoformat(), "note": note})
+        sauvegarder_memoire(memoire)
+        await update.message.reply_text(reponse_user)
+    elif texte:
+        await update.message.reply_text(texte)
 
 if __name__ == "__main__":
     print("Démarrage du bot coach...")
