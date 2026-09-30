@@ -456,4 +456,4 @@ async def send_reply(cid, text, bot):
         text = parts[0].strip()
         save_note(parts[1].strip().split("\n")[0])
     
-    save_chat_msg("coach", text
+    save_chat_msg("coach", text)
