@@ -6,7 +6,7 @@ import requests
 from requests.auth import HTTPBasicAuth
 from google import genai
 from telegram import Update
-from telegram.constants import ChatAction
+from telegram.constants import ChatAction, ParseMode
 from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters
 
 INTERVALS_ATHLETE_ID = os.environ.get("INTERVALS_ATHLETE_ID", "0").strip() or "0"
@@ -24,14 +24,14 @@ MEMORY_FILE = "coach_memory.json"
 def charger_memoire():
     if not os.path.exists(MEMORY_FILE):
         return {
-            "profil": "Coureur préparant un 10 km sous les 40 min. Pratique régulière, renforcement musculaire intégré.",
+            "profil": "Coureur préparant un 5 km sub-20 (Course du Lake Boga le 13/12/2026). Allure cible 3'59/km.",
             "notes_historique": []
         }
     try:
         with open(MEMORY_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
     except:
-        return {"profil": "Coureur 10 km sous 40 min", "notes_historique": []}
+        return {"profil": "Coureur 5 km sub-20 (Lake Boga)", "notes_historique": []}
 
 def sauvegarder_memoire(data):
     with open(MEMORY_FILE, "w", encoding="utf-8") as f:
@@ -154,20 +154,17 @@ def appel_gemini_robuste(prompt):
                     return response.text
             except Exception as e:
                 err_str = str(e)
-                # En cas de 503 (surcharge), on patiente de plus en plus longtemps
                 if "503" in err_str or "UNAVAILABLE" in err_str:
-                    wait_time = (attempt + 1) * 2  # 2s, 4s, 6s...
+                    wait_time = (attempt + 1) * 2
                     time.sleep(wait_time)
                     continue
-                # Si erreur autre, on tente directement le modèle suivant
                 break
-    return "Le service d'analyse est actuellement saturé côté Google. Merci de réessayer dans 30 secondes."
+    return "Service temporairement indisponible. Réessaie dans quelques secondes."
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != TELEGRAM_USER_ID:
         return
 
-    # Affiche le statut "en train d'écrire..." sur Telegram
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
 
     message = update.message.text
@@ -180,47 +177,56 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     prompt = f"""Tu es l'entraîneur d'athlétisme personnel de ce coureur.
 Tu as accès à l'ensemble de sa télémétrie sportive et physiologique Intervals.icu.
-Approche : Rigoureuse, basée sur les données réelles (modèle 80/20 polarisé, seuils LT1/LT2, découplage aérobie, charge Bannister/Coggan). Pas de blabla superficiel.
 
 PROFIL ATHLÈTE & ZONES :
 {json.dumps(profil, ensure_ascii=False)}
 
 MÉMOIRE & HISTORIQUE CONTINU :
 {memoire['profil']}
-Derniers faits marquants enregistrés : {json.dumps(memoire['notes_historique'][-10:], ensure_ascii=False)}
+Derniers faits marquants : {json.dumps(memoire['notes_historique'][-10:], ensure_ascii=False)}
 
-PHYSIOLOGIE & SANTÉ (3 dernières semaines : Sommeil, VFC rMSSD vs Baseline, FC repos, ATL, CTL, TSB, Courbatures) :
+PHYSIOLOGIE & SANTÉ (3 semaines : Sommeil, VFC rMSSD, FC repos, ATL, CTL, TSB) :
 {json.dumps(sante, ensure_ascii=False, indent=2)}
 
-SÉANCES DES 4 DERNIERS MOIS (Allures, FC moy/max, Découplage %, Cadence, Temps par zone FC, RPE) :
+SÉANCES DES 4 DERNIERS MOIS (Allures, FC moy/max, Découplage %, Cadence, Zones FC) :
 {json.dumps(activites, ensure_ascii=False, indent=2)}
 
-SÉANCES ACTUELLEMENT PLANIFIÉES (7 prochains jours) :
+SÉANCES PLANIFIÉES (7 prochains jours) :
 {json.dumps(planifiees, ensure_ascii=False, indent=2)}
 
 MESSAGE DE L'ATHLÈTE :
 "{message}"
 
-Directives :
-1. Croise systématiquement les données (sommeil/VFC avec FC de séance, TSB/ATL avec charge des séances, allure vs zone cible).
-2. Donne un avis direct, franc, précis et chiffré.
-3. Si l'athlète te partage une information durable (douleur, ressenti d'effort, événement, modification d'objectif), inscris-la en fin de réponse sous la forme :
+RÈGLES STRICTES DE MISE EN FORME TELEGRAM :
+- La lecture sur smartphone doit être aérée, percutante et agréable.
+- INTERDIT d'utiliser des dièses (pas de #, ## ou ###). Utilise à la place du texte en GRAS propre et des sauts de ligne.
+- Ne fais jamais de longs pavés de texte. Découpe en courts paragraphes de 2-3 lignes max.
+- Utilise des tirets simples `-` pour les listes. Pas d'étoiles doubles au milieu de tirets.
+- Structure ta réponse en 3 temps maximum :
+  1. Le constat chiffré direct (faits et métriques clés).
+  2. L'analyse physiologique concise (pourquoi c'est comme ça).
+  3. La recommandation / plan d'action immédiat.
+- Si une information durable est partagée par l'athlète, écris en fin de réponse :
 [MEMOIRE] note précise à enregistrer
 """
     texte = appel_gemini_robuste(prompt)
 
+    reponse_user = texte
     if "[MEMOIRE]" in texte:
         parts = texte.split("[MEMOIRE]")
         reponse_user = parts[0].strip()
         note = parts[1].strip().split("\n")[0]
         memoire["notes_historique"].append({"date": datetime.date.today().isoformat(), "note": note})
         sauvegarder_memoire(memoire)
+
+    # Envoi sécurisé en mode Markdown (avec repli en texte brut si formatage exotique)
+    try:
+        await update.message.reply_text(reponse_user, parse_mode=ParseMode.MARKDOWN)
+    except Exception:
         await update.message.reply_text(reponse_user)
-    else:
-        await update.message.reply_text(texte)
 
 if __name__ == "__main__":
-    print("Démarrage du bot coach avec télémétrie complète et gestion robuste des erreurs...")
+    print("Démarrage du bot coach avec affichage optimisé pour mobile...")
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
     app.run_polling()
