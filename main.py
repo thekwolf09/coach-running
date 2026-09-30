@@ -136,11 +136,11 @@ def get_all_data():
     return f1.result(), f2.result(), f3.result(), f4.result()
 
 def planifier_seance(date_str: str, titre: str, description: str = "") -> str:
-    """Planifie une séance d'entraînement sur Intervals.icu.
+    """Planifie une séance d'entraînement de course à pied sur Intervals.icu.
     Args:
-        date_str: Date au format AAAA-MM-JJ (ex: '2026-09-30').
+        date_str: Date de la séance au format AAAA-MM-JJ (ex: '2026-09-30').
         titre: Titre court de la séance.
-        description: Consignes d'allures et intensités.
+        description: Consignes d'allures, intensités et zones.
     """
     headers = {"Content-Type": "application/json"}
     today_iso = datetime.date.today().isoformat()
@@ -162,35 +162,32 @@ def planifier_seance(date_str: str, titre: str, description: str = "") -> str:
         return f"Erreur de connexion Intervals : {err}"
 
 def generate_ai(prompt_parts, user_msg_raw=""):
-    models = ["gemini-3.8-flash"]
-    dernier_souci = ""
-    for m in models:
-        for attempt in range(3):
-            try:
-                cfg = types.GenerateContentConfig(tools=[planifier_seance], temperature=0.3)
-                r = ai_client.models.generate_content(model=m, contents=prompt_parts, config=cfg)
-                if r.function_calls:
-                    call = r.function_calls[0]
-                    args = dict(call.args) if call.args else {}
-                    t_res = planifier_seance(**args)
-                    conf_prompt = (
-                        f"Action exécutée : {t_res}.\n"
-                        f"Demande initiale de l'athlète : '{user_msg_raw}'.\n"
-                        f"Confirme à l'athlète en format HTML Telegram (utilise <b>Texte en gras</b> pour les allures) "
-                        f"avec un court conseil d'allure pour cette séance."
-                    )
-                    time.sleep(1.5)
-                    r_conf = ai_client.models.generate_content(model=m, contents=conf_prompt)
-                    return r_conf.text
-                if r and r.text:
-                    return r.text
-            except Exception as e:
-                dernier_souci = str(e)
-                if "429" in dernier_souci or "RESOURCE_EXHAUSTED" in dernier_souci:
-                    time.sleep(2.5)
-                    continue
-                break
-    return f"⚠️ Service momentanément saturé côté Google : {dernier_souci}"
+    for _ in range(3):
+        try:
+            cfg = types.GenerateContentConfig(tools=[planifier_seance], temperature=0.3)
+            r = ai_client.models.generate_content(model="gemini-3.8-flash", contents=prompt_parts, config=cfg)
+            if r.function_calls:
+                call = r.function_calls[0]
+                args = dict(call.args) if call.args else {}
+                t_res = planifier_seance(**args)
+                time.sleep(2)
+                conf_prompt = (
+                    f"Action exécutée : {t_res}.\n"
+                    f"Demande initiale de l'athlète : '{user_msg_raw}'.\n"
+                    f"Confirme à l'athlète en format HTML Telegram (utilise <b>Texte en gras</b> pour les allures) "
+                    f"avec un court conseil d'allure pour cette séance."
+                )
+                r_conf = ai_client.models.generate_content(model="gemini-3.8-flash", contents=conf_prompt)
+                return r_conf.text
+            if r and r.text:
+                return r.text
+        except Exception as e:
+            err_str = str(e)
+            if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
+                time.sleep(3)
+                continue
+            time.sleep(2)
+    return "Google a temporairement saturé, réessaie dans 5 secondes."
 
 def make_prompt(prof, well, acts, evts, user_msg):
     mem = get_notes()
@@ -251,6 +248,7 @@ def bg_loop():
     time.sleep(15)
     url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
 
+    # Enregistrement silencieux au boot pour ne pas déclencher d'appels simultanés
     try:
         _, well_init, acts_init, _ = get_all_data()
         conn = sqlite3.connect(DB)
@@ -301,4 +299,4 @@ if __name__ == "__main__":
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_text))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))
     app.run_polling()
-    
+                
