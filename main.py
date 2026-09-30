@@ -28,7 +28,7 @@ BASE_URL = f"https://intervals.icu/api/v1/athlete/{INTERVALS_ATHLETE_ID}"
 DB_FILE = "coach_brain.db"
 EXECUTOR = ThreadPoolExecutor(max_workers=6)
 
-# --- BASE DE DONNÉES PERSISTANTE SQLITE ---
+# --- BASE DE DONNÉES SQLITE ---
 def init_db():
     with sqlite3.connect(DB_FILE) as conn:
         cursor = conn.cursor()
@@ -61,7 +61,7 @@ def save_memory_note(note_text: str, category: str = "general"):
         cursor.execute("INSERT INTO memory_notes (date, category, content) VALUES (?, ?, ?)", (today, category, note_text))
         conn.commit()
 
-def get_recent_memory_notes(limit=30):
+def get_recent_memory_notes(limit=25):
     with sqlite3.connect(DB_FILE) as conn:
         cursor = conn.cursor()
         cursor.execute("SELECT date, content FROM memory_notes ORDER BY id DESC LIMIT ?", (limit,))
@@ -97,12 +97,12 @@ def mark_wellness_processed(date_str: str):
 # --- APPELS TÉLÉMÉTRIQUES INTERVALS.ICU ---
 def fetch_profil_athlete():
     try:
-        r = requests.get(BASE_URL, auth=AUTH, timeout=10)
+        r = requests.get(BASE_URL, auth=AUTH, timeout=8)
         if r.status_code == 200:
             d = r.json()
             return {
                 "zones_fc": d.get("icu_hr_zones"),
-                "fc_repos_base": d.get("icu_resting_hr"),
+                "fc_max_enregistree": d.get("icu_resting_hr"),
                 "seuil_lactique_lthr": d.get("icu_lthr"),
                 "poids_reference": d.get("weight")
             }
@@ -115,28 +115,25 @@ def fetch_wellness_complet():
     oldest = (datetime.date.today() - datetime.timedelta(days=180)).isoformat()
     url = f"{BASE_URL}/wellness"
     try:
-        r = requests.get(url, auth=AUTH, params={"oldest": oldest, "newest": today}, timeout=15)
+        r = requests.get(url, auth=AUTH, params={"oldest": oldest, "newest": today}, timeout=10)
         if r.status_code == 200:
             wellness = r.json()
             if isinstance(wellness, list):
-                wellness_sorted = sorted(wellness, key=lambda x: x.get('id', ''), reverse=True)
-                return [{
-                    "date": j.get("id"),
-                    "sommeil_heures": round(j.get("sleepSecs", 0) / 3600, 1) if j.get("sleepSecs") else None,
-                    "score_sommeil": j.get("sleepScore"),
-                    "qualite_sommeil": j.get("sleepQuality"),
-                    "vfc_rmssd": j.get("hrv"),
-                    "vfc_baseline": j.get("hrvBaseline"),
-                    "fc_repos": j.get("restingHR"),
-                    "forme_tsb": j.get("form"),
-                    "fatigue_aigue_atl": j.get("atl"),
-                    "condition_physique_ctl": j.get("ctl"),
-                    "stress": j.get("stress"),
-                    "courbatures_soreness": j.get("soreness"),
-                    "fatigue_percue": j.get("fatigue"),
-                    "poids_kg": j.get("weight"),
-                    "hydratation_l": j.get("water")
-                } for j in wellness_sorted]
+                res = []
+                for j in wellness:
+                    if j.get("sleepSecs") or j.get("hrv") or j.get("ctl"):
+                        res.append({
+                            "date": j.get("id"),
+                            "sommeil_heures": round(j.get("sleepSecs", 0) / 3600, 1) if j.get("sleepSecs") else None,
+                            "score_sommeil": j.get("sleepScore"),
+                            "vfc_rmssd": j.get("hrv"),
+                            "vfc_baseline": j.get("hrvBaseline"),
+                            "fc_repos": j.get("restingHR"),
+                            "forme_tsb": j.get("form"),
+                            "fatigue_aigue_atl": j.get("atl"),
+                            "condition_physique_ctl": j.get("ctl")
+                        })
+                return res
     except Exception as e:
         print(f"Erreur wellness: {e}")
     return []
@@ -145,32 +142,26 @@ def fetch_activites_enrichies():
     url = f"{BASE_URL}/activities"
     oldest = (datetime.date.today() - datetime.timedelta(days=180)).isoformat()
     try:
-        r = requests.get(url, auth=AUTH, params={"oldest": oldest}, timeout=20)
+        r = requests.get(url, auth=AUTH, params={"oldest": oldest}, timeout=10)
         if r.status_code == 200:
             activites = r.json()
             if isinstance(activites, list):
-                activites_sorted = sorted(activites, key=lambda x: x.get('start_date_local', ''), reverse=True)
                 res = []
-                for act in activites_sorted[:100]:
+                for act in activites[:70]:
                     v_ms = act.get("average_speed", 0)
                     allure = f"{int((1000/v_ms)//60)}'{int((1000/v_ms)%60):02d}\"/km" if v_ms and v_ms > 0 else None
                     res.append({
                         "id": act.get("id"),
-                        "date": act.get("start_date_local", "")[:16],
+                        "date": act.get("start_date_local", "")[:10],
                         "nom": act.get("name"),
                         "type": act.get("type"),
-                        "distance_km": round(act.get("distance", 0) / 1000, 2),
+                        "km": round(act.get("distance", 0) / 1000, 2),
                         "duree_min": round(act.get("moving_time", 0) / 60, 1),
-                        "allure_moyenne": allure,
-                        "fc_moyenne": act.get("average_heartrate"),
+                        "allure_moy": allure,
+                        "fc_moy": act.get("average_heartrate"),
                         "fc_max": act.get("max_heartrate"),
-                        "cadence_moyenne": act.get("average_cadence"),
-                        "denivele_d_plus": act.get("total_elevation_gain"),
-                        "charge_icu": act.get("icu_training_load"),
-                        "decouplage_cardiaque_pct": act.get("icu_decoupling"),
-                        "repartition_zones_fc_sec": act.get("icu_hr_zone_times"),
-                        "ressenti_rpe": act.get("perceived_exertion"),
-                        "commentaires": act.get("description")
+                        "charge": act.get("icu_training_load"),
+                        "decouplage_pct": act.get("icu_decoupling")
                     })
                 return res
     except Exception as e:
@@ -182,7 +173,7 @@ def fetch_seances_planifiees():
     dans_13_semaines = (datetime.date.today() + datetime.timedelta(days=91)).isoformat()
     url = f"{BASE_URL}/events"
     try:
-        r = requests.get(url, auth=AUTH, params={"oldest": today, "newest": dans_13_semaines}, timeout=15)
+        r = requests.get(url, auth=AUTH, params={"oldest": today, "newest": dans_13_semaines}, timeout=8)
         if r.status_code == 200:
             events = r.json()
             if isinstance(events, list):
@@ -190,7 +181,7 @@ def fetch_seances_planifiees():
                     "id": e.get("id"),
                     "date": e.get("start_date_local", "")[:10],
                     "nom": e.get("name"),
-                    "description": e.get("description")
+                    "desc": e.get("description")
                 } for e in events]
     except Exception as e:
         print(f"Erreur events: {e}")
@@ -216,23 +207,195 @@ def modifier_ou_creer_seance(date_str: str, titre: str, description_workout: str
     try:
         if event_id:
             url = f"{BASE_URL}/events/{event_id}"
-            r = requests.put(url, auth=AUTH, headers=headers, json=payload, timeout=10)
+            r = requests.put(url, auth=AUTH, headers=headers, json=payload, timeout=8)
         else:
             url = f"{BASE_URL}/events"
-            r = requests.post(url, auth=AUTH, headers=headers, json=payload, timeout=10)
+            r = requests.post(url, auth=AUTH, headers=headers, json=payload, timeout=8)
         if r.status_code in (200, 201):
             return f"Séance '{titre}' enregistrée sur Intervals.icu pour le {date_str}."
         return f"Erreur Intervals.icu ({r.status_code}) : {r.text}"
     except Exception as e:
-        return f"Erreur lors de la programmation : {e}"
+        return f"Erreur : {e}"
 
 # --- MOTEUR GEMINI ---
 def generer_analyse(prompt_parts, tools=None):
-    models = ["gemini-3.8-flash", "gemini-2.5-flash"]
+    models = ["gemini-2.5-flash", "gemini-3.8-flash"]
     for model in models:
-        for attempt in range(4):
+        for attempt in range(3):
             try:
                 config = types.GenerateContentConfig(tools=tools, temperature=0.3) if tools else types.GenerateContentConfig(temperature=0.3)
+                resp = ai_client.models.generate_content(
+                    model=model,
+                    contents=prompt_parts,
+                    config=config
+                )
+
+                if tools and resp.function_calls:
+                    call = resp.function_calls[0]
+                    res_tool = modifier_ou_creer_seance(**call.args)
+                    suivi = ai_client.models.generate_content(
+                        model=model,
+                        contents=[
+                            prompt_parts if isinstance(prompt_parts, list) else [prompt_parts],
+                            resp.candidates[0].content,
+                            types.Content(role="user", parts=[types.Part.from_function_response(name="modifier_ou_creer_seance", response={"result": res_tool})])
+                        ]
+                    )
+                    return suivi.text
+
+                if resp and resp.text:
+                    return resp.text
+
+            except Exception as e:
+                if "503" in str(e) or "UNAVAILABLE" in str(e):
+                    time.sleep(1.5)
+                    continue
+                break
+    return "Service temporairement indisponible côté Google."
+
+def construire_contexte_global(profil, sante, activites, planifiees):
+    memoire = get_recent_memory_notes(limit=25)
+    
+    return f"""Tu es l'entraîneur personnel en athlétisme de ce coureur.
+Date du jour : {datetime.date.today().isoformat()}.
+Objectif prioritaire : 5 km sub-20 (Course du Lake Boga le 13/12/2026, allure cible 3'59/km).
+
+PROFIL ATHLÈTE :
+{json.dumps(profil, ensure_ascii=False)}
+
+MÉMOIRE DURABLE (Base SQLite) :
+{json.dumps(memoire, ensure_ascii=False)}
+
+PHYSIOLOGIE SUR 6 MOIS (Sommeil, VFC rMSSD vs Baseline, FC repos, ATL, CTL, TSB) :
+{json.dumps(sante, ensure_ascii=False)}
+
+SÉANCES SUR 6 MOIS (Allures, FC, Découplage %, Cadence, Charge) :
+{json.dumps(activites, ensure_ascii=False)}
+
+PLAN SUR 13 SEMAINES (Cycle complet du calendrier) :
+{json.dumps(planifiees, ensure_ascii=False)}
+
+DIRECTIVES DE RÉPONSE :
+1. Analyse croisée : recul sur les 6 mois passés + forme et sommeil du jour + plan sur 13 semaines.
+2. FORMAT HTML TELEGRAM OBLIGATOIRE :
+   - Pas de #, pas de **.
+   - Utilise <b>Texte en gras</b> pour les titres, allures et métriques clés.
+   - Utilise <i>Texte en italique</i> si besoin.
+   - Aère avec des lignes vides.
+   - Émojis sobres (📊, 🫀, 🎯).
+3. Si un fait durable est mentionné, écris en fin de message :
+[MEMOIRE] note à enregistrer
+"""
+
+async def envoyer_reponse(chat_id, texte, bot):
+    if "[MEMOIRE]" in texte:
+        parts = texte.split("[MEMOIRE]")
+        reponse_user = parts[0].strip()
+        note = parts[1].strip().split("\n")[0]
+        save_memory_note(note)
+    else:
+        reponse_user = texte
+
+    try:
+        await bot.send_message(chat_id=chat_id, text=reponse_user, parse_mode=ParseMode.HTML)
+    except Exception:
+        await bot.send_message(chat_id=chat_id, text=reponse_user)
+
+# --- HANDLERS TELEGRAM ---
+async def handle_message_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != TELEGRAM_USER_ID:
+        return
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
+
+    loop = asyncio.get_running_loop()
+    profil, sante, activites, planifiees = await loop.run_in_executor(EXECUTOR, get_toutes_les_donnees)
+    
+    contexte = construire_contexte_global(profil, sante, activites, planifiees)
+    prompt = f"{contexte}\n\nMESSAGE ATHLÈTE :\n\"{update.message.text}\""
+    
+    texte = await loop.run_in_executor(EXECUTOR, generer_analyse, prompt, [modifier_ou_creer_seance])
+    await envoyer_reponse(update.effective_chat.id, texte, context.bot)
+
+async def handle_message_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != TELEGRAM_USER_ID:
+        return
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.RECORD_VOICE)
+
+    voice = update.message.voice or update.message.audio
+    file = await context.bot.get_file(voice.file_id)
+    audio_buffer = io.BytesIO()
+    await file.download_to_memory(audio_buffer)
+    audio_bytes = audio_buffer.getvalue()
+
+    loop = asyncio.get_running_loop()
+    profil, sante, activites, planifiees = await loop.run_in_executor(EXECUTOR, get_toutes_les_donnees)
+    contexte = construire_contexte_global(profil, sante, activites, planifiees)
+    
+    prompt_parts = [
+        contexte,
+        types.Part.from_bytes(data=audio_bytes, mime_type="audio/ogg"),
+        "Message vocal de l'athlète. Analyse ses propos et réponds-lui avec précision."
+    ]
+
+    texte = await loop.run_in_executor(EXECUTOR, generer_analyse, prompt_parts, [modifier_ou_creer_seance])
+    await envoyer_reponse(update.effective_chat.id, texte, context.bot)
+
+# --- SURVEILLANCE ARRIÈRE-PLAN ---
+async def background_surveillance(bot):
+    await asyncio.sleep(20)
+    loop = asyncio.get_running_loop()
+    while True:
+        try:
+            profil, sante, activites, planifiees = await loop.run_in_executor(EXECUTOR, get_toutes_les_donnees)
+
+            if activites:
+                derniere = activites[0]
+                act_id = str(derniere.get("id"))
+                with sqlite3.connect(DB_FILE) as conn:
+                    cursor = conn.cursor()
+                    cursor.execute("SELECT COUNT(*) FROM processed_activities")
+                    if cursor.fetchone()[0] == 0:
+                        mark_activity_processed(act_id)
+                    elif not is_activity_processed(act_id):
+                        mark_activity_processed(act_id)
+                        contexte = construire_contexte_global(profil, sante, activites, planifiees)
+                        prompt = f"""{contexte}\n\nÉVÉNEMENT PROACTIF : Nouvelle séance détectée !\n{json.dumps(derniere, ensure_ascii=False)}\nDébrief express."""
+                        texte = await loop.run_in_executor(EXECUTOR, generer_analyse, prompt)
+                        await bot.send_message(chat_id=TELEGRAM_USER_ID, text=f"🏁 <b>Nouvelle séance détectée !</b>\n\n{texte}", parse_mode=ParseMode.HTML)
+
+            if sante:
+                derniere_sante = sante[0]
+                date_nuit = derniere_sante.get("date")
+                sommeil = derniere_sante.get("sommeil_heures")
+                with sqlite3.connect(DB_FILE) as conn:
+                    cursor = conn.cursor()
+                    cursor.execute("SELECT COUNT(*) FROM processed_wellness")
+                    if cursor.fetchone()[0] == 0:
+                        if date_nuit:
+                            mark_wellness_processed(date_nuit)
+                    elif sommeil and sommeil > 0 and not is_wellness_processed(date_nuit):
+                        mark_wellness_processed(date_nuit)
+                        contexte = construire_contexte_global(profil, sante, activites, planifiees)
+                        prompt = f"""{contexte}\n\nÉVÉNEMENT PROACTIF : Réveil ({date_nuit}). Données enregistrées :\n{json.dumps(derniere_sante, ensure_ascii=False)}\nBrief matinal."""
+                        texte = await loop.run_in_executor(EXECUTOR, generer_analyse, prompt)
+                        await bot.send_message(chat_id=TELEGRAM_USER_ID, text=f"☀️ <b>Réveil détecté · Métriques physiologiques</b>\n\n{texte}", parse_mode=ParseMode.HTML)
+
+        except Exception as e:
+            print(f"Erreur surveillance: {e}")
+
+        await asyncio.sleep(900)
+
+async def demarrer_taches(app):
+    asyncio.create_task(background_surveillance(app.bot))
+
+if __name__ == "__main__":
+    init_db()
+    print("Démarrage du bot coach complet...")
+    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).post_init(demarrer_taches).build()
+    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message_text))
+    app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_message_voice))
+    app.run_polling()
+ tools else types.GenerateContentConfig(temperature=0.3)
                 resp = ai_client.models.generate_content(
                     model=model,
                     contents=prompt_parts,
