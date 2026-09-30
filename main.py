@@ -5,6 +5,7 @@ import datetime
 import requests
 from requests.auth import HTTPBasicAuth
 from google import genai
+from google.genai import types
 from telegram import Update
 from telegram.constants import ChatAction, ParseMode
 from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters
@@ -129,34 +130,98 @@ def get_wellness_complet(jours=21):
 
 def get_seances_planifiees():
     today = datetime.date.today().isoformat()
-    dans_7_jours = (datetime.date.today() + datetime.timedelta(days=7)).isoformat()
+    dans_14_jours = (datetime.date.today() + datetime.timedelta(days=14)).isoformat()
     url = f"{BASE_URL}/events"
     try:
-        r = requests.get(url, auth=AUTH, params={"oldest": today, "newest": dans_7_jours}, timeout=10)
+        r = requests.get(url, auth=AUTH, params={"oldest": today, "newest": dans_14_jours}, timeout=10)
         if r.status_code == 200:
             events = r.json()
             if isinstance(events, list):
-                return [{"date": e.get("start_date_local", "")[:10], "nom": e.get("name"), "description": e.get("description")} for e in events]
+                return [{
+                    "id": e.get("id"),
+                    "date": e.get("start_date_local", "")[:10],
+                    "nom": e.get("name"),
+                    "description": e.get("description")
+                } for e in events]
     except Exception as e:
         print(f"Erreur events: {e}")
     return []
 
-def appel_gemini_robuste(prompt):
+# Outil d'écriture Intervals.icu : création ou mise à jour de séance
+def modifier_ou_creer_seance(date_str: str, titre: str, description_workout: str, event_id: int = None) -> str:
+    """Modifie une séance existante ou en programme une nouvelle sur Intervals.icu."""
+    headers = {"Content-Type": "application/json"}
+    payload = {
+        "category": "WORKOUT",
+        "type": "Run",
+        "name": titre,
+        "description": description_workout,
+        "start_date_local": f"{date_str}T08:00:00"
+    }
+
+    try:
+        if event_id:
+            url = f"{BASE_URL}/events/{event_id}"
+            r = requests.put(url, auth=AUTH, headers=headers, json=payload, timeout=10)
+        else:
+            url = f"{BASE_URL}/events"
+            r = requests.post(url, auth=AUTH, headers=headers, json=payload, timeout=10)
+
+        if r.status_code in (200, 201):
+            return f"Séance '{titre}' enregistrée avec succès sur Intervals.icu pour le {date_str}."
+        else:
+            return f"Erreur Intervals.icu ({r.status_code}) : {r.text}"
+    except Exception as e:
+        return f"Erreur lors de la mise à jour de la séance : {e}"
+
+def appel_gemini_avec_outils(prompt):
     modeles = ["gemini-3.8-flash", "gemini-2.5-flash"]
     for model_name in modeles:
-        for attempt in range(4):
+        for attempt in range(3):
             try:
                 response = ai_client.models.generate_content(
                     model=model_name,
-                    contents=prompt
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        tools=[modifier_ou_creer_seance],
+                        temperature=0.3
+                    )
                 )
+
+                # Si l'IA déclenche l'outil de modification de séance
+                if response.function_calls:
+                    tool_call = response.function_calls[0]
+                    args = tool_call.args
+                    resultat_tool = modifier_ou_creer_seance(
+                        date_str=args.get("date_str"),
+                        titre=args.get("titre"),
+                        description_workout=args.get("description_workout"),
+                        event_id=args.get("event_id")
+                    )
+                    # Relance avec le résultat de l'outil pour obtenir la confirmation finale
+                    suivi = ai_client.models.generate_content(
+                        model=model_name,
+                        contents=[
+                            prompt,
+                            response.candidates[0].content,
+                            types.Content(
+                                role="user",
+                                parts=[types.Part.from_function_response(
+                                    name="modifier_ou_creer_seance",
+                                    response={"resultat": resultat_tool}
+                                )]
+                            )
+                        ]
+                    )
+                    return suivi.text
+
                 if response and response.text:
                     return response.text
+
             except Exception as e:
                 err_str = str(e)
                 if "503" in err_str or "UNAVAILABLE" in err_str:
-                    wait_time = (attempt + 1) * 2
-                    time.sleep(wait_time)
+                    time.sleep((attempt + 1) * 2)
                     continue
                 break
     return "Service temporairement indisponible côté Google. Réessaie dans un instant."
@@ -174,9 +239,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     activites = get_activites_enrichies(limit=30)
     sante = get_wellness_complet(jours=21)
     planifiees = get_seances_planifiees()
+    date_du_jour = datetime.date.today().isoformat()
 
     prompt = f"""Tu es l'entraîneur d'athlétisme personnel de ce coureur.
-Tu as accès à l'ensemble de sa télémétrie sportive et physiologique Intervals.icu.
+Date d'aujourd'hui : {date_du_jour}.
+
+Tu as accès complet à sa télémétrie sportive et physiologique Intervals.icu.
+Tu disposes aussi de l'outil `modifier_ou_creer_seance` pour programmer ou ajuster directement des séances dans son calendrier Intervals.icu / Garmin.
 
 PROFIL ATHLÈTE & ZONES :
 {json.dumps(profil, ensure_ascii=False)}
@@ -188,27 +257,34 @@ Derniers faits marquants : {json.dumps(memoire['notes_historique'][-10:], ensure
 PHYSIOLOGIE & SANTÉ (3 semaines : Sommeil, VFC rMSSD, FC repos, ATL, CTL, TSB) :
 {json.dumps(sante, ensure_ascii=False, indent=2)}
 
-SÉANCES DES 4 DERNIERS MOIS (Allures, FC moy/max, Découplage %, Cadence, Zones FC) :
+SÉANCES DES 4 DERNIERS MOIS (Allures, FC, Découplage, Cadence, Zones FC) :
 {json.dumps(activites, ensure_ascii=False, indent=2)}
 
-SÉANCES PLANIFIÉES (7 prochains jours) :
+SÉANCES ACTUELLEMENT PLANIFIÉES DANS LE CALENDRIER :
 {json.dumps(planifiees, ensure_ascii=False, indent=2)}
 
 MESSAGE DE L'ATHLÈTE :
 "{message}"
 
-CONSIGNES STRICTES DE FORMATAGE (FORMAT HTML OBLIGATOIRE) :
+CONSIGNES DE MODIFICATION / PLANIFICATION :
+- Si l'athlète te demande d'adapter, déplacer ou créer une séance (ou si tu juges sur sa physiologie qu'un allègement/reprogrammation est indispensable et qu'il le sollicite) :
+  -> Appelle la fonction `modifier_ou_creer_seance`.
+  -> Dans `description_workout`, utilise la syntaxe officielle d'Intervals.icu pour structurer le workout (ex:
+     - 15m 65-75% HR
+     - 5x 1000m 3:55-4:00/km recovery 2m 60-70% HR
+     - 10m 60-70% HR
+  -> Si c'est une séance existante du calendrier, fournis son `event_id`.
+
+CONSIGNES STRICTES DE FORMATAGE (HTML OBLIGATOIRE) :
 - N'utilise PAS de Markdown (*, **, #). Utilise STRICTEMENT des balises HTML supportées par Telegram :
-  • <b>Texte en gras</b> pour mettre en valeur les titres, allures et métriques clés.
-  • <i>Texte en italique</i> pour les précisions physiologiques.
-  • <code>code ou chiffre clé</code> si utile.
-- Rends le message TRÈS AÉRÉ et visuel avec de vrais sauts de ligne (laisse une ligne vide entre chaque point).
-- Utilise des émojis discrets en tête de section (ex: 📊 pour l'état des lieux, 🫀 pour la physiologie/récupération, 🎯 pour les conseils concrets/séance suivante).
-- Style direct, percutant, zéro remplissage.
+  • <b>Texte en gras</b> pour les titres, allures et métriques clés.
+  • <i>Texte en italique</i> pour les explications physiologiques.
+- Rends le message AÉRÉ avec des sauts de ligne réguliers.
+- Utilise des émojis discrets en tête de section (📊, 🫀, 🎯).
 - Si une information durable est partagée par l'athlète, écris en toute fin :
 [MEMOIRE] note précise à enregistrer
 """
-    texte = appel_gemini_robuste(prompt)
+    texte = appel_gemini_avec_outils(prompt)
 
     reponse_user = texte
     if "[MEMOIRE]" in texte:
@@ -218,15 +294,13 @@ CONSIGNES STRICTES DE FORMATAGE (FORMAT HTML OBLIGATOIRE) :
         memoire["notes_historique"].append({"date": datetime.date.today().isoformat(), "note": note})
         sauvegarder_memoire(memoire)
 
-    # Envoi direct en HTML Telegram
     try:
         await update.message.reply_text(reponse_user, parse_mode=ParseMode.HTML)
     except Exception:
-        # Repli si une balise HTML était mal fermée
         await update.message.reply_text(reponse_user)
 
 if __name__ == "__main__":
-    print("Démarrage du bot coach avec formatage HTML natif...")
+    print("Démarrage du bot coach avec capacité de planification et synchronisation Garmin...")
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
     app.run_polling()
