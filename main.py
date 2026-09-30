@@ -43,6 +43,12 @@ def init_db():
                 processed_at TEXT
             )
         """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS processed_wellness (
+                wellness_date TEXT PRIMARY KEY,
+                processed_at TEXT
+            )
+        """)
         conn.commit()
 
 def save_memory_note(note_text: str, category: str = "general"):
@@ -70,6 +76,19 @@ def mark_activity_processed(act_id: str):
     with sqlite3.connect(DB_FILE) as conn:
         cursor = conn.cursor()
         cursor.execute("INSERT OR IGNORE INTO processed_activities (activity_id, processed_at) VALUES (?, ?)", (str(act_id), now))
+        conn.commit()
+
+def is_wellness_processed(date_str: str) -> bool:
+    with sqlite3.connect(DB_FILE) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT 1 FROM processed_wellness WHERE wellness_date = ?", (str(date_str),))
+        return cursor.fetchone() is not None
+
+def mark_wellness_processed(date_str: str):
+    now = datetime.datetime.now().isoformat()
+    with sqlite3.connect(DB_FILE) as conn:
+        cursor = conn.cursor()
+        cursor.execute("INSERT OR IGNORE INTO processed_wellness (wellness_date, processed_at) VALUES (?, ?)", (str(date_str), now))
         conn.commit()
 
 # --- API INTERVALS.ICU ---
@@ -222,7 +241,7 @@ SÉANCES RÉCENTES D'ENTRAÎNEMENT (Allures, FC, Découplage, Cadence) :
 
 RÈGLES STRICTES DE MISE EN FORME :
 - Format HTML Telegram UNIQUEMENT (<b>gras</b> pour titres/chiffres, <i>italique</i> si besoin).
-- Aéré, percutant, pas de pavé indigeste.
+- Aéré, percutant, pas de pavé indigeste. Laisse des lignes vides entre chaque point.
 - Émojis sobres (📊, 🫀, 🎯).
 - Si une information durable est donnée (douleur, ressenti clé, imprévu), finis par :
 [MEMOIRE] note à conserver
@@ -236,6 +255,137 @@ async def handle_message_text(update: Update, context: ContextTypes.DEFAULT_TYPE
     
     contexte = construire_contexte_global()
     prompt = f"{contexte}\n\nMESSAGE DE L'ATHLÈTE :\n\"{update.message.text}\""
+    texte = generer_analyse(prompt, tools=[modifier_ou_creer_seance])
+    await envoyer_reponse(update.effective_chat.id, texte, context.bot)
+
+async def handle_message_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != TELEGRAM_USER_ID:
+        return
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.RECORD_VOICE)
+
+    voice = update.message.voice or update.message.audio
+    file = await context.bot.get_file(voice.file_id)
+    audio_buffer = io.BytesIO()
+    await file.download_to_memory(audio_buffer)
+    audio_bytes = audio_buffer.getvalue()
+
+    contexte = construire_contexte_global()
+    prompt_parts = [
+        contexte,
+        types.Part.from_bytes(data=audio_bytes, mime_type="audio/ogg"),
+        "Voici le message vocal de l'athlète. Écoute son ressenti, analyse ses propos et réponds-lui avec précision."
+    ]
+
+    texte = generer_analyse(prompt_parts, tools=[modifier_ou_creer_seance])
+    await envoyer_reponse(update.effective_chat.id, texte, context.bot)
+
+async def envoyer_reponse(chat_id, texte, bot):
+    if "[MEMOIRE]" in texte:
+        parts = texte.split("[MEMOIRE]")
+        reponse_user = parts[0].strip()
+        note = parts[1].strip().split("\n")[0]
+        save_memory_note(note)
+    else:
+        reponse_user = texte
+
+    try:
+        await bot.send_message(chat_id=chat_id, text=reponse_user, parse_mode=ParseMode.HTML)
+    except Exception:
+        await bot.send_message(chat_id=chat_id, text=reponse_user)
+
+# --- PROACTIVITÉ (TÂCHES DE FOND TOUTES LES 15 MIN) ---
+async def job_debrief_post_seance(context: ContextTypes.DEFAULT_TYPE):
+    """Vérifie toutes les 15 minutes si une nouvelle séance Garmin a été injectée sur Intervals.icu."""
+    acts = get_activites_enrichies(limit=2)
+    if not acts:
+        return
+    derniere = acts[0]
+    act_id = str(derniere.get("id"))
+
+    # Initialisation au tout premier lancement pour ne pas débriefer l'historique ancien
+    with sqlite3.connect(DB_FILE) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM processed_activities")
+        count = cursor.fetchone()[0]
+        if count == 0:
+            mark_activity_processed(act_id)
+            return
+
+    if not is_activity_processed(act_id):
+        mark_activity_processed(act_id)
+        contexte = construire_contexte_global()
+        prompt = f"""{contexte}
+
+ÉVÉNEMENT PROACTIF : L'athlète vient d'enregistrer une NOUVELLE séance sportive !
+Détails de la séance :
+{json.dumps(derniere, ensure_ascii=False, indent=2)}
+
+Mission : Fais un débrief immédiat, chaleureux mais rigoureux de cette séance (analyse de l'allure, régularité cardiaque, découplage, respect des zones). Donne les consignes de récupération immédiate."""
+        
+        texte = generer_analyse(prompt)
+        await context.bot.send_message(chat_id=TELEGRAM_USER_ID, text=f"🏁 <b>Nouvelle séance détectée !</b>\n\n{texte}", parse_mode=ParseMode.HTML)
+
+async def job_check_nouveau_sommeil(context: ContextTypes.DEFAULT_TYPE):
+    """Vérifie si les données de sommeil de la dernière nuit viennent d'arriver depuis Garmin."""
+    sante = get_wellness_complet(jours=2)
+    if not sante:
+        return
+    
+    derniere_sante = sante[0]
+    date_nuit = derniere_sante.get("date")
+    sommeil = derniere_sante.get("sommeil_h")
+
+    # Initialisation au tout premier lancement
+    with sqlite3.connect(DB_FILE) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM processed_wellness")
+        count = cursor.fetchone()[0]
+        if count == 0:
+            if date_nuit:
+                mark_wellness_processed(date_nuit)
+            return
+
+    # Si Garmin a bien renseigné le sommeil et qu'il n'a pas encore été analysé
+    if sommeil and sommeil > 0 and not is_wellness_processed(date_nuit):
+        mark_wellness_processed(date_nuit)
+        
+        contexte = construire_contexte_global()
+        prompt = f"""{contexte}
+
+ÉVÉNEMENT PROACTIF : Les données de sommeil et de VFC de la nuit ({date_nuit}) viennent d'arriver depuis Garmin !
+Détails physiologiques du réveil :
+{json.dumps(derniere_sante, ensure_ascii=False, indent=2)}
+
+Mission : Fais un brief matinal percutant et aéré (durée/score sommeil, VFC vs baseline habituelle, forme TSB).
+Valide la séance prévue aujourd'hui ou préconise un ajustement immédiat selon sa récupération réelle."""
+
+        texte = generer_analyse(prompt)
+        await context.bot.send_message(
+            chat_id=TELEGRAM_USER_ID,
+            text=f"☀️ <b>Réveil détecté · Métriques physiologiques</b>\n\n{texte}",
+            parse_mode=ParseMode.HTML
+        )
+
+# --- LANCEMENT DE L'APPLICATION ---
+if __name__ == "__main__":
+    init_db()
+    print("Démarrage du coach augmenté (Mémoire SQLite, Vocal natif & Détection proactive)...")
+    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+    
+    # Handlers messages texte et audio vocal
+    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message_text))
+    app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_message_voice))
+
+    # Tâches planifiées proactives (boucles de fond toutes les 15 minutes)
+    job_queue = app.job_queue
+    if job_queue:
+        # Surveillance de nouvelle séance de course
+        job_queue.run_repeating(job_debrief_post_seance, interval=900, first=60)
+        # Surveillance de nouvelle nuit Garmin
+        job_queue.run_repeating(job_check_nouveau_sommeil, interval=900, first=90)
+
+    app.run_polling()
+ntexte}\n\nMESSAGE DE L'ATHLÈTE :\n\"{update.message.text}\""
     texte = generer_analyse(prompt, tools=[modifier_ou_creer_seance])
     await envoyer_reponse(update.effective_chat.id, texte, context.bot)
 
