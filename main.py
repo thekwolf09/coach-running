@@ -1,6 +1,8 @@
 import os
+import io
 import json
 import time
+import sqlite3
 import datetime
 import requests
 from requests.auth import HTTPBasicAuth
@@ -10,6 +12,7 @@ from telegram import Update
 from telegram.constants import ChatAction, ParseMode
 from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters
 
+# --- CONFIGURATION ENVIRONNEMENT ---
 INTERVALS_ATHLETE_ID = os.environ.get("INTERVALS_ATHLETE_ID", "0").strip() or "0"
 INTERVALS_API_KEY = os.environ.get("INTERVALS_API_KEY", "").strip()
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
@@ -20,136 +23,132 @@ ai_client = genai.Client(api_key=GEMINI_API_KEY)
 AUTH = HTTPBasicAuth("API_KEY", INTERVALS_API_KEY)
 BASE_URL = f"https://intervals.icu/api/v1/athlete/{INTERVALS_ATHLETE_ID}"
 
-MEMORY_FILE = "coach_memory.json"
+DB_FILE = "coach_brain.db"
 
-def charger_memoire():
-    if not os.path.exists(MEMORY_FILE):
-        return {
-            "profil": "Coureur préparant un 5 km sub-20 (Course du Lake Boga le 13/12/2026). Allure cible 3'59/km.",
-            "notes_historique": []
-        }
-    try:
-        with open(MEMORY_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except:
-        return {"profil": "Coureur 5 km sub-20 (Lake Boga)", "notes_historique": []}
+# --- PERSISTANCE SQLITE ---
+def init_db():
+    with sqlite3.connect(DB_FILE) as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS memory_notes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                date TEXT,
+                category TEXT,
+                content TEXT
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS processed_activities (
+                activity_id TEXT PRIMARY KEY,
+                processed_at TEXT
+            )
+        """)
+        conn.commit()
 
-def sauvegarder_memoire(data):
-    with open(MEMORY_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+def save_memory_note(note_text: str, category: str = "general"):
+    today = datetime.date.today().isoformat()
+    with sqlite3.connect(DB_FILE) as conn:
+        cursor = conn.cursor()
+        cursor.execute("INSERT INTO memory_notes (date, category, content) VALUES (?, ?, ?)", (today, category, note_text))
+        conn.commit()
 
+def get_recent_memory_notes(limit=15):
+    with sqlite3.connect(DB_FILE) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT date, content FROM memory_notes ORDER BY id DESC LIMIT ?", (limit,))
+        rows = cursor.fetchall()
+        return [{"date": r[0], "note": r[1]} for r in reversed(rows)]
+
+def is_activity_processed(act_id: str) -> bool:
+    with sqlite3.connect(DB_FILE) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT 1 FROM processed_activities WHERE activity_id = ?", (str(act_id),))
+        return cursor.fetchone() is not None
+
+def mark_activity_processed(act_id: str):
+    now = datetime.datetime.now().isoformat()
+    with sqlite3.connect(DB_FILE) as conn:
+        cursor = conn.cursor()
+        cursor.execute("INSERT OR IGNORE INTO processed_activities (activity_id, processed_at) VALUES (?, ?)", (str(act_id), now))
+        conn.commit()
+
+# --- API INTERVALS.ICU ---
 def get_profil_athlete():
     try:
         r = requests.get(BASE_URL, auth=AUTH, timeout=10)
         if r.status_code == 200:
-            data = r.json()
+            d = r.json()
             return {
-                "zones_fc": data.get("icu_hr_zones"),
-                "fc_max_enregistree": data.get("icu_resting_hr"),
-                "seuil_lactique_fc": data.get("icu_lthr"),
-                "poids_reference": data.get("weight")
+                "zones_fc": d.get("icu_hr_zones"),
+                "fc_max": d.get("icu_resting_hr"),
+                "seuil_lthr": d.get("icu_lthr")
             }
     except Exception as e:
         print(f"Erreur profil: {e}")
     return {}
 
-def get_activites_enrichies(limit=30):
+def get_activites_enrichies(limit=25):
     url = f"{BASE_URL}/activities"
-    oldest = (datetime.date.today() - datetime.timedelta(days=120)).isoformat()
+    oldest = (datetime.date.today() - datetime.timedelta(days=90)).isoformat()
     try:
         r = requests.get(url, auth=AUTH, params={"oldest": oldest}, timeout=15)
         if r.status_code == 200:
-            activites = r.json()
-            if not isinstance(activites, list):
+            acts = r.json()
+            if not isinstance(acts, list):
                 return []
-            activites_recentes = sorted(activites, key=lambda x: x.get('start_date_local', ''), reverse=True)
-            resume = []
-            for act in activites_recentes[:limit]:
-                vitesse_ms = act.get("average_speed", 0)
-                allure_str = None
-                if vitesse_ms and vitesse_ms > 0:
-                    sec_per_km = 1000 / vitesse_ms
-                    allure_str = f"{int(sec_per_km // 60)}'{int(sec_per_km % 60):02d}\"/km"
-
-                resume.append({
-                    "date": act.get("start_date_local", "")[:10],
+            acts_sorted = sorted(acts, key=lambda x: x.get('start_date_local', ''), reverse=True)
+            res = []
+            for act in acts_sorted[:limit]:
+                v_ms = act.get("average_speed", 0)
+                allure = f"{int((1000/v_ms)//60)}'{int((1000/v_ms)%60):02d}\"/km" if v_ms and v_ms > 0 else None
+                res.append({
+                    "id": act.get("id"),
+                    "date": act.get("start_date_local", "")[:16],
                     "nom": act.get("name"),
                     "type": act.get("type"),
                     "distance_km": round(act.get("distance", 0) / 1000, 2),
                     "duree_min": round(act.get("moving_time", 0) / 60, 1),
-                    "allure_moyenne": allure_str,
-                    "fc_moyenne": act.get("average_heartrate"),
+                    "allure_moy": allure,
+                    "fc_moy": act.get("average_heartrate"),
                     "fc_max": act.get("max_heartrate"),
-                    "cadence_moyenne": act.get("average_cadence"),
-                    "denivele_d_plus": act.get("total_elevation_gain"),
+                    "cadence": act.get("average_cadence"),
                     "charge_icu": act.get("icu_training_load"),
-                    "decouplage_cardiaque_pct": act.get("icu_decoupling"),
-                    "repartition_zones_fc_sec": act.get("icu_hr_zone_times"),
-                    "ressenti_rpe": act.get("perceived_exertion"),
-                    "commentaires": act.get("description")
+                    "decouplage_pct": act.get("icu_decoupling")
                 })
-            return resume
+            return res
     except Exception as e:
-        print(f"Erreur activites: {e}")
+        print(f"Erreur activities: {e}")
     return []
 
-def get_wellness_complet(jours=21):
+def get_wellness_complet(jours=14):
     today = datetime.date.today().isoformat()
     oldest = (datetime.date.today() - datetime.timedelta(days=jours)).isoformat()
     url = f"{BASE_URL}/wellness"
     try:
         r = requests.get(url, auth=AUTH, params={"oldest": oldest, "newest": today}, timeout=15)
         if r.status_code == 200:
-            wellness = r.json()
-            if not isinstance(wellness, list):
-                return []
-            wellness_recents = sorted(wellness, key=lambda x: x.get('id', ''), reverse=True)
-            resume_sante = []
-            for j in wellness_recents:
-                resume_sante.append({
+            well = r.json()
+            if isinstance(well, list):
+                well_sorted = sorted(well, key=lambda x: x.get('id', ''), reverse=True)
+                return [{
                     "date": j.get("id"),
-                    "sommeil_heures": round(j.get("sleepSecs", 0) / 3600, 1) if j.get("sleepSecs") else None,
+                    "sommeil_h": round(j.get("sleepSecs", 0) / 3600, 1) if j.get("sleepSecs") else None,
                     "score_sommeil": j.get("sleepScore"),
-                    "qualite_sommeil": j.get("sleepQuality"),
                     "vfc_rmssd": j.get("hrv"),
                     "vfc_baseline": j.get("hrvBaseline"),
                     "fc_repos": j.get("restingHR"),
                     "forme_tsb": j.get("form"),
-                    "fatigue_aigue_atl": j.get("atl"),
-                    "condition_physique_ctl": j.get("ctl"),
+                    "fatigue_atl": j.get("atl"),
+                    "condition_ctl": j.get("ctl"),
                     "stress": j.get("stress"),
-                    "courbatures_soreness": j.get("soreness"),
-                    "fatigue_percue": j.get("fatigue"),
-                    "poids_kg": j.get("weight"),
-                    "hydratation_l": j.get("water")
-                })
-            return resume_sante
+                    "courbatures": j.get("soreness")
+                } for j in well_sorted]
     except Exception as e:
         print(f"Erreur wellness: {e}")
     return []
 
-def get_seances_planifiees():
-    today = datetime.date.today().isoformat()
-    dans_14_jours = (datetime.date.today() + datetime.timedelta(days=14)).isoformat()
-    url = f"{BASE_URL}/events"
-    try:
-        r = requests.get(url, auth=AUTH, params={"oldest": today, "newest": dans_14_jours}, timeout=10)
-        if r.status_code == 200:
-            events = r.json()
-            if isinstance(events, list):
-                return [{
-                    "id": e.get("id"),
-                    "date": e.get("start_date_local", "")[:10],
-                    "nom": e.get("name"),
-                    "description": e.get("description")
-                } for e in events]
-    except Exception as e:
-        print(f"Erreur events: {e}")
-    return []
-
-# Outil d'écriture Intervals.icu : création ou mise à jour de séance
 def modifier_ou_creer_seance(date_str: str, titre: str, description_workout: str, event_id: int = None) -> str:
-    """Modifie une séance existante ou en programme une nouvelle sur Intervals.icu."""
+    """Modifie ou crée une séance planifiée dans le calendrier Intervals.icu / Garmin."""
     headers = {"Content-Type": "application/json"}
     payload = {
         "category": "WORKOUT",
@@ -158,7 +157,6 @@ def modifier_ou_creer_seance(date_str: str, titre: str, description_workout: str
         "description": description_workout,
         "start_date_local": f"{date_str}T08:00:00"
     }
-
     try:
         if event_id:
             url = f"{BASE_URL}/events/{event_id}"
@@ -166,73 +164,180 @@ def modifier_ou_creer_seance(date_str: str, titre: str, description_workout: str
         else:
             url = f"{BASE_URL}/events"
             r = requests.post(url, auth=AUTH, headers=headers, json=payload, timeout=10)
-
         if r.status_code in (200, 201):
-            return f"Séance '{titre}' enregistrée avec succès sur Intervals.icu pour le {date_str}."
-        else:
-            return f"Erreur Intervals.icu ({r.status_code}) : {r.text}"
+            return f"Séance '{titre}' enregistrée sur Intervals.icu pour le {date_str}."
+        return f"Erreur Intervals.icu ({r.status_code}) : {r.text}"
     except Exception as e:
-        return f"Erreur lors de la mise à jour de la séance : {e}"
+        return f"Erreur d'enregistrement : {e}"
 
-def appel_gemini_avec_outils(prompt):
-    modeles = ["gemini-3.8-flash", "gemini-2.5-flash"]
-    for model_name in modeles:
+# --- MOTEUR GEMINI ROBUSTE ---
+def generer_analyse(prompt_parts, tools=None):
+    models = ["gemini-3.8-flash", "gemini-2.5-flash"]
+    config = types.GenerateContentConfig(tools=tools, temperature=0.3) if tools else types.GenerateContentConfig(temperature=0.3)
+    for model in models:
         for attempt in range(3):
             try:
-                response = ai_client.models.generate_content(
-                    model=model_name,
-                    contents=prompt,
-                    config=types.GenerateContentConfig(
-                        tools=[modifier_ou_creer_seance],
-                        temperature=0.3
-                    )
-                )
-
-                # Si l'IA déclenche l'outil de modification de séance
-                if response.function_calls:
-                    tool_call = response.function_calls[0]
-                    args = tool_call.args
-                    resultat_tool = modifier_ou_creer_seance(
-                        date_str=args.get("date_str"),
-                        titre=args.get("titre"),
-                        description_workout=args.get("description_workout"),
-                        event_id=args.get("event_id")
-                    )
-                    # Relance avec le résultat de l'outil pour obtenir la confirmation finale
+                resp = ai_client.models.generate_content(model=model, contents=prompt_parts, config=config)
+                if tools and resp.function_calls:
+                    call = resp.function_calls[0]
+                    res = modifier_ou_creer_seance(**call.args)
                     suivi = ai_client.models.generate_content(
-                        model=model_name,
+                        model=model,
                         contents=[
-                            prompt,
-                            response.candidates[0].content,
-                            types.Content(
-                                role="user",
-                                parts=[types.Part.from_function_response(
-                                    name="modifier_ou_creer_seance",
-                                    response={"resultat": resultat_tool}
-                                )]
-                            )
+                            prompt_parts if isinstance(prompt_parts, list) else [prompt_parts],
+                            resp.candidates[0].content,
+                            types.Content(role="user", parts=[types.Part.from_function_response(name="modifier_ou_creer_seance", response={"result": res})])
                         ]
                     )
                     return suivi.text
-
-                if response and response.text:
-                    return response.text
-
+                if resp and resp.text:
+                    return resp.text
             except Exception as e:
-                err_str = str(e)
-                if "503" in err_str or "UNAVAILABLE" in err_str:
+                if "503" in str(e) or "UNAVAILABLE" in str(e):
                     time.sleep((attempt + 1) * 2)
                     continue
                 break
-    return "Service temporairement indisponible côté Google. Réessaie dans un instant."
+    return "Service temporairement indisponible."
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+def construire_contexte_global():
+    memoire = get_recent_memory_notes(limit=15)
+    sante = get_wellness_complet(jours=14)
+    activites = get_activites_enrichies(limit=20)
+    profil = get_profil_athlete()
+    
+    return f"""Tu es l'entraîneur d'athlétisme personnel expert de ce coureur (objectif 5 km sub-20 / allures 3'59/km).
+Date actuelle : {datetime.date.today().isoformat()}.
+
+PROFIL ATHLÈTE & SEUILS :
+{json.dumps(profil, ensure_ascii=False)}
+
+MÉMOIRE DURABLE (Base SQLite) :
+{json.dumps(memoire, ensure_ascii=False, indent=2)}
+
+PHYSIOLOGIE & SANTÉ (14 derniers jours : Sommeil, VFC rMSSD vs Baseline, FC repos, ATL, CTL, TSB) :
+{json.dumps(sante, ensure_ascii=False, indent=2)}
+
+SÉANCES RÉCENTES D'ENTRAÎNEMENT (Allures, FC, Découplage, Cadence) :
+{json.dumps(activites, ensure_ascii=False, indent=2)}
+
+RÈGLES STRICTES DE MISE EN FORME :
+- Format HTML Telegram UNIQUEMENT (<b>gras</b> pour titres/chiffres, <i>italique</i> si besoin).
+- Aéré, percutant, pas de pavé indigeste.
+- Émojis sobres (📊, 🫀, 🎯).
+- Si une information durable est donnée (douleur, ressenti clé, imprévu), finis par :
+[MEMOIRE] note à conserver
+"""
+
+# --- GESTION DES MESSAGES UTILISATEUR ---
+async def handle_message_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != TELEGRAM_USER_ID:
         return
-
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
+    
+    contexte = construire_contexte_global()
+    prompt = f"{contexte}\n\nMESSAGE DE L'ATHLÈTE :\n\"{update.message.text}\""
+    texte = generer_analyse(prompt, tools=[modifier_ou_creer_seance])
+    await envoyer_reponse(update.effective_chat.id, texte, context.bot)
 
-    message = update.message.text
+async def handle_message_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != TELEGRAM_USER_ID:
+        return
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.RECORD_VOICE)
+
+    voice = update.message.voice or update.message.audio
+    file = await context.bot.get_file(voice.file_id)
+    audio_buffer = io.BytesIO()
+    await file.download_to_memory(audio_buffer)
+    audio_bytes = audio_buffer.getvalue()
+
+    contexte = construire_contexte_global()
+    prompt_parts = [
+        contexte,
+        types.Part.from_bytes(data=audio_bytes, mime_type="audio/ogg"),
+        "Voici le message vocal de l'athlète. Écoute son ressenti, analyse ses propos et réponds-lui avec précision."
+    ]
+
+    texte = generer_analyse(prompt_parts, tools=[modifier_ou_creer_seance])
+    await envoyer_reponse(update.effective_chat.id, texte, context.bot)
+
+async def envoyer_reponse(chat_id, texte, bot):
+    if "[MEMOIRE]" in texte:
+        parts = texte.split("[MEMOIRE]")
+        reponse_user = parts[0].strip()
+        note = parts[1].strip().split("\n")[0]
+        save_memory_note(note)
+    else:
+        reponse_user = texte
+
+    try:
+        await bot.send_message(chat_id=chat_id, text=reponse_user, parse_mode=ParseMode.HTML)
+    except Exception:
+        await bot.send_message(chat_id=chat_id, text=reponse_user)
+
+# --- PROACTIVITÉ (CRON & TÂCHES DE FOND) ---
+async def job_debrief_post_seance(context: ContextTypes.DEFAULT_TYPE):
+    """Vérifie toutes les 15 minutes si une nouvelle séance Garmin a été injectée sur Intervals.icu."""
+    acts = get_activites_enrichies(limit=2)
+    if not acts:
+        return
+    derniere = acts[0]
+    act_id = str(derniere.get("id"))
+
+    # Initialisation au premier lancement pour ne pas débriefer le passé
+    with sqlite3.connect(DB_FILE) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM processed_activities")
+        count = cursor.fetchone()[0]
+        if count == 0:
+            mark_activity_processed(act_id)
+            return
+
+    if not is_activity_processed(act_id):
+        mark_activity_processed(act_id)
+        contexte = construire_contexte_global()
+        prompt = f"""{contexte}
+
+ÉVÉNEMENT PROACTIF : L'athlète vient d'enregistrer une NOUVELLE séance sportive !
+Détails de la séance :
+{json.dumps(derniere, ensure_ascii=False, indent=2)}
+
+Mission : Fais un débrief immédiat, chaleureux mais rigoureux de cette séance (analyse de l'allure, régularité cardiaque, découplage, respect des zones). Donne les consignes de récupération immédiate."""
+        
+        texte = generer_analyse(prompt)
+        await context.bot.send_message(chat_id=TELEGRAM_USER_ID, text=f"🏁 <b>Nouvelle séance détectée !</b>\n\n{texte}", parse_mode=ParseMode.HTML)
+
+async def job_brief_matinal(context: ContextTypes.DEFAULT_TYPE):
+    """Envoie un point métabolique chaque matin à 7h30."""
+    contexte = construire_contexte_global()
+    prompt = f"""{contexte}
+
+ÉVÉNEMENT PROACTIF : C'est le réveil (brief matinal).
+Mission : Analyse la nuit qui vient de se terminer (durée, score sommeil, VFC du matin vs baseline habituelle, TSB).
+Valide ou alerte l'athlète sur la capacité du jour à encaisser l'entraînement prévu."""
+    
+    texte = generer_analyse(prompt)
+    await context.bot.send_message(chat_id=TELEGRAM_USER_ID, text=f"☀️ <b>Brief Forme & Sommeil du Jour</b>\n\n{texte}", parse_mode=ParseMode.HTML)
+
+# --- LANCEMENT APPLICATION ---
+if __name__ == "__main__":
+    init_db()
+    print("Démarrage du coach augmenté (Mémoire SQLite, Reconnaissance Vocale & Proactivité)...")
+    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+    
+    # Handlers messages texte et audio vocal
+    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message_text))
+    app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_message_voice))
+
+    # Tâches planifiées proactives
+    job_queue = app.job_queue
+    if job_queue:
+        # Vérifie l'arrivée d'une nouvelle séance toutes les 15 minutes (900 secondes)
+        job_queue.run_repeating(job_debrief_post_seance, interval=900, first=60)
+        # Brief matinal quotidien à 07h30 (heure locale)
+        job_queue.run_daily(job_brief_matinal, time=datetime.time(hour=7, minute=30))
+
+    app.run_polling()
+t
     memoire = charger_memoire()
     
     profil = get_profil_athlete()
