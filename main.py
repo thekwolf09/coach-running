@@ -256,21 +256,5 @@ if __name__ == "__main__":
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_text))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))
     app.run_polling()
-INSERT OR IGNORE INTO seen_well
-                    c.commit()
-                    ans = generate_ai(make_prompt(prof, well, acts, evts, f"Nuit de sommeil: {well[0]}"))
-                    requests.post(url, json={"chat_id": TG_USER, "text": f"<b>Reveil detecte</b>\n\n{ans}", "parse_mode": "HTML"}, timeout=10)
-            c.close()
-        except Exception:
-            pass
-        time.sleep(900)
 
-if __name__ == "__main__":
-    init_db()
-    print("Coach Running pret !")
-    threading.Thread(target=bg_loop, daemon=True).start()
-    app = ApplicationBuilder().token(TG_TOKEN).build()
-    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_text))
-    app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))
-    app.run_polling()
-                      
+        
