@@ -446,7 +446,8 @@ def generate_ai(prompt_parts, user_msg_raw=""):
         temperature=0.3
     )
 
-    for _ in range(3):
+    # On augmente les essais et le temps de pause pour laisser l'API digérer les gros prompts
+    for essai in range(5):
         try:
             r = ai_client.models.generate_content(model=MODEL_NAME, contents=prompt_parts, config=cfg)
             if r.function_calls:
@@ -469,13 +470,14 @@ def generate_ai(prompt_parts, user_msg_raw=""):
                 return r.text
         except Exception as e:
             dernier_bug = str(e)
-            logging.error(f"Erreur generate_ai : {e}")
+            logging.error(f"Erreur generate_ai (essai {essai+1}) : {e}")
             if "429" in dernier_bug or "RESOURCE_EXHAUSTED" in dernier_bug:
-                time.sleep(3)
+                # Pause progressive en cas de saturation de l'API
+                time.sleep(4 * (essai + 1))
                 continue
-            time.sleep(1.5)
+            time.sleep(2)
 
-    return f"⚠️ Erreur détaillée : {dernier_bug}"
+    return f"⚠️ Google sature un peu trop sur ce volume de données (429). Réessaie dans quelques secondes !"
 
 def make_prompt(prof, weather, well, acts, evts, user_msg):
     mem = get_notes()
