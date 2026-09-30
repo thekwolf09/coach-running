@@ -132,7 +132,7 @@ def planifier_seance(date_str: str, titre: str, description: str = "") -> str:
         return f"Erreur de connexion Intervals : {err}"
 
 def generate_ai(prompt_parts, user_msg_raw=""):
-    models = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-pro"]
+    models = ["gemini-2.5-flash", "gemini-2.0-flash"]
     dernier_souci = ""
     for m in models:
         try:
