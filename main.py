@@ -1,4 +1,11 @@
-import os, io, json, time, sqlite3, datetime, threading, requests
+import os
+import io
+import json
+import time
+import sqlite3
+import datetime
+import threading
+import requests
 from concurrent.futures import ThreadPoolExecutor
 from requests.auth import HTTPBasicAuth
 from google import genai
@@ -20,23 +27,27 @@ DB = "coach_brain.db"
 POOL = ThreadPoolExecutor(max_workers=4)
 
 def init_db():
-    c = sqlite3.connect(DB)
+    conn = sqlite3.connect(DB)
+    c = conn.cursor()
     c.execute("CREATE TABLE IF NOT EXISTS notes (id INTEGER PRIMARY KEY AUTOINCREMENT, d TEXT, txt TEXT)")
     c.execute("CREATE TABLE IF NOT EXISTS seen_acts (id TEXT PRIMARY KEY)")
     c.execute("CREATE TABLE IF NOT EXISTS seen_well (d TEXT PRIMARY KEY)")
-    c.commit()
-    c.close()
+    conn.commit()
+    conn.close()
 
 def save_note(txt):
-    c = sqlite3.connect(DB)
+    conn = sqlite3.connect(DB)
+    c = conn.cursor()
     c.execute("INSERT INTO notes (d, txt) VALUES (?, ?)", (datetime.date.today().isoformat(), txt))
-    c.commit()
-    c.close()
+    conn.commit()
+    conn.close()
 
 def get_notes():
-    c = sqlite3.connect(DB)
-    rows = c.execute("SELECT d, txt FROM notes ORDER BY id DESC LIMIT 20").fetchall()
-    c.close()
+    conn = sqlite3.connect(DB)
+    c = conn.cursor()
+    c.execute("SELECT d, txt FROM notes ORDER BY id DESC LIMIT 20")
+    rows = c.fetchall()
+    conn.close()
     return [{"date": r[0], "note": r[1]} for r in reversed(rows)]
 
 def fetch_profile():
@@ -44,7 +55,11 @@ def fetch_profile():
         r = requests.get(BASE, auth=AUTH, timeout=8)
         if r.status_code == 200:
             d = r.json()
-            return {"zones": d.get("icu_hr_zones"), "lthr": d.get("icu_lthr"), "weight": d.get("weight")}
+            return {
+                "zones": d.get("icu_hr_zones"),
+                "lthr": d.get("icu_lthr"),
+                "weight": d.get("weight")
+            }
     except Exception:
         pass
     return {}
@@ -79,7 +94,7 @@ def fetch_activities():
         r = requests.get(f"{BASE}/activities", auth=AUTH, params={"oldest": old}, timeout=10)
         if r.status_code == 200:
             res = []
-            for a in r.json()[:60]:
+            for a in r.json()[:70]:
                 spd = a.get("average_speed", 0)
                 pace = f"{int((1000/spd)//60)}'{int((1000/spd)%60):02d}\"/km" if spd > 0 else None
                 res.append({
@@ -103,7 +118,12 @@ def fetch_events():
     try:
         r = requests.get(f"{BASE}/events", auth=AUTH, params={"oldest": today, "newest": fut}, timeout=8)
         if r.status_code == 200:
-            return [{"id": e.get("id"), "d": e.get("start_date_local", "")[:10], "nom": e.get("name"), "desc": e.get("description")} for e in r.json()]
+            return [{
+                "id": e.get("id"),
+                "d": e.get("start_date_local", "")[:10],
+                "nom": e.get("name"),
+                "desc": e.get("description")
+            } for e in r.json()]
     except Exception:
         pass
     return []
@@ -116,67 +136,82 @@ def get_all_data():
     return f1.result(), f2.result(), f3.result(), f4.result()
 
 def planifier_seance(date_str: str, titre: str, description: str = "") -> str:
-    """Planifie une séance de course à pied sur Intervals.icu."""
+    """Planifie une séance d'entraînement sur Intervals.icu.
+    Args:
+        date_str: Date au format AAAA-MM-JJ (ex: '2026-09-30').
+        titre: Titre court de la séance.
+        description: Consignes d'allures et intensités.
+    """
     headers = {"Content-Type": "application/json"}
-    date_val = f"{date_str}T18:00:00" if "T" not in date_str else date_str
+    today_iso = datetime.date.today().isoformat()
+    target_date = today_iso if any(k in str(date_str).lower() for k in ["today", "aujourd", "soir"]) else str(date_str).split("T")[0]
+
     payload = {
-        "category": "WORKOUT", "type": "Run", "name": titre,
-        "description": description, "start_date_local": date_val
+        "category": "WORKOUT",
+        "type": "Run",
+        "name": titre,
+        "description": description or f"Séance : {titre}",
+        "start_date_local": f"{target_date}T18:00:00"
     }
     try:
         r = requests.post(f"{BASE}/events", auth=AUTH, headers=headers, json=payload, timeout=8)
         if r.status_code in (200, 201):
-            return f"Séance '{titre}' ajoutée sur Intervals.icu pour le {date_str}."
-                return f"Erreur retour Intervals ({r.status_code})"
+            return f"Séance '{titre}' bien enregistrée sur Intervals.icu le {target_date}."
+        return f"Erreur retour Intervals ({r.status_code})"
     except Exception as err:
         return f"Erreur de connexion Intervals : {err}"
 
 def generate_ai(prompt_parts, user_msg_raw=""):
-    models = ["gemini-3.8-flash"]
+    models = ["gemini-3.8-flash", "gemini-2.5-flash"]
     dernier_souci = ""
     for m in models:
-        try:
-            cfg = types.GenerateContentConfig(tools=[planifier_seance], temperature=0.3)
-            r = ai_client.models.generate_content(model=m, contents=prompt_parts, config=cfg)
-            if r.function_calls:
-                call = r.function_calls[0]
-                args = call.args or {}
-                tool_res = planifier_seance(**args)
-                conf = f"Action exécutée : {tool_res}. Demande : '{user_msg_raw}'. Confirme avec conseil d'allure court en HTML Telegram."
-                return ai_client.models.generate_content(model=m, contents=conf).text
-            if r and r.text:
-                return r.text
-        except Exception as e:
-            dernier_souci = str(e)
+        for attempt in range(3):
             try:
-                r_direct = ai_client.models.generate_content(model=m, contents=prompt_parts)
-                if r_direct and r_direct.text:
-                    return f"{r_direct.text}\n\n⚠️ (Action planning failed. Detailed error: {dernier_souci})"
-            except Exception as direct_e:
-                dernier_souci = f"main: {e} | direct: {direct_e}"
-            continue
-    return f"⚠️ Service détaillé temporairement indisponible côté Google : {dernier_souci}"
+                cfg = types.GenerateContentConfig(tools=[planifier_seance], temperature=0.3)
+                r = ai_client.models.generate_content(model=m, contents=prompt_parts, config=cfg)
+                if r.function_calls:
+                    call = r.function_calls[0]
+                    args = dict(call.args) if call.args else {}
+                    t_res = planifier_seance(**args)
+                    conf_prompt = (
+                        f"Action exécutée : {t_res}.\n"
+                        f"Demande initiale de l'athlète : '{user_msg_raw}'.\n"
+                        f"Confirme à l'athlète en format HTML Telegram (utilise <b>Texte en gras</b> pour les allures) "
+                        f"avec un court conseil d'allure pour cette séance."
+                    )
+                    time.sleep(1.5)
+                    r_conf = ai_client.models.generate_content(model=m, contents=conf_prompt)
+                    return r_conf.text
+                if r and r.text:
+                    return r.text
+            except Exception as e:
+                dernier_souci = str(e)
+                if "429" in dernier_souci or "RESOURCE_EXHAUSTED" in dernier_souci:
+                    time.sleep(2.5)
+                    continue
+                break
+    return f"⚠️ Service momentanément saturé côté Google : {dernier_souci}"
 
 def make_prompt(prof, well, acts, evts, user_msg):
     mem = get_notes()
     consignes = (
-        "Directives :\n"
-        "1. Analyse croisée (6 mois passés, nuit actuelle, 13 semaines à venir).\n"
-        "2. FORMAT HTML TELEGRAM : <b>Gras</b> pour allures et chiffres clés. "
-        "Aère avec sauts de ligne. Pas de # ni de **.\n"
-        "3. Si fait durable, termine par : [MEMOIRE] note à enregistrer\n"
-        "4. Si l'athlète demande d'ajouter ou planifier une séance, utilise l'outil planifier_seance."
+        "Consignes d'analyse :\n"
+        "1. Analyse croisée complète : 6 mois passés, nuit actuelle, 13 semaines à venir.\n"
+        "2. FORMAT HTML TELEGRAM : utilise <b>Texte en gras</b> pour les allures et chiffres clés. "
+        "Aère avec des lignes vides. Pas de dièses (#) ni d'astérisques (**).\n"
+        "3. Si un fait durable est mentionné, écris en fin de message : [MEMOIRE] note à enregistrer\n"
+        "4. Si l'athlète demande d'ajouter ou planifier une séance, utilise obligatoirement l'outil planifier_seance."
     )
     return (
-        f"Tu es l'entraîneur d'athlétisme personnel (objectif 5km sub-20, cible 3'59/km au 13/12/2026).\n"
-        f"Date : {datetime.date.today().isoformat()}.\n\n"
-        f"PROFIL: {json.dumps(prof, ensure_ascii=False)}\n"
-        f"MEMOIRE: {json.dumps(mem, ensure_ascii=False)}\n"
-        f"SANTE 6 MOIS: {json.dumps(well, ensure_ascii=False)}\n"
-        f"SEANCES 6 MOIS: {json.dumps(acts, ensure_ascii=False)}\n"
-        f"PLAN 13 SEMAINES: {json.dumps(evts, ensure_ascii=False)}\n\n"
+        f"Tu es l'entraîneur d'athlétisme personnel de ce coureur (objectif prioritaire : 5 km sub-20, cible 3'59/km au 13/12/2026).\n"
+        f"Date du jour : {datetime.date.today().isoformat()}.\n\n"
+        f"PROFIL ATHLÈTE : {json.dumps(prof, ensure_ascii=False)}\n"
+        f"MÉMOIRE DURABLE (Base SQLite) : {json.dumps(mem, ensure_ascii=False)}\n"
+        f"SANTÉ SUR 6 MOIS : {json.dumps(well, ensure_ascii=False)}\n"
+        f"SÉANCES SUR 6 MOIS : {json.dumps(acts, ensure_ascii=False)}\n"
+        f"PLAN SUR 13 SEMAINES : {json.dumps(evts, ensure_ascii=False)}\n\n"
         f"{consignes}\n\n"
-        f"MESSAGE ATHLÈTE :\n\"{user_msg}\""
+        f"MESSAGE DE L'ATHLÈTE :\n\"{user_msg}\""
     )
 
 async def send_reply(cid, text, bot):
@@ -208,46 +243,62 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     buf = io.BytesIO()
     await f.download_to_memory(buf)
     prof, well, acts, evts = get_all_data()
-    prompt = [make_prompt(prof, well, acts, evts, "Message vocal athlète"), types.Part.from_bytes(data=buf.getvalue(), mime_type="audio/ogg")]
+    prompt = [make_prompt(prof, well, acts, evts, "Message vocal"), types.Part.from_bytes(data=buf.getvalue(), mime_type="audio/ogg")]
     ans = generate_ai(prompt, user_msg_raw="Message vocal")
     await send_reply(update.effective_chat.id, ans, context.bot)
 
 def bg_loop():
-    time.sleep(30)
+    time.sleep(15)
     url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
+
+    try:
+        _, well_init, acts_init, _ = get_all_data()
+        conn = sqlite3.connect(DB)
+        c = conn.cursor()
+        for a in acts_init:
+            c.execute("INSERT OR IGNORE INTO seen_acts VALUES (?)", (str(a["id"]),))
+        if well_init and well_init[0].get("d"):
+            c.execute("INSERT OR IGNORE INTO seen_well VALUES (?)", (str(well_init[0]["d"]),))
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
+
     while True:
+        time.sleep(900)
         try:
             prof, well, acts, evts = get_all_data()
-            c = sqlite3.connect(DB)
-            # Initialisation silencieuse silencieuse si base vierge pour éviter spam au boot
-            if c.execute("SELECT COUNT(*) FROM seen_acts").fetchone()[0] == 0 and acts:
-                c.execute("INSERT OR IGNORE INTO seen_acts VALUES (?)", (str(acts[0]["id"]),))
-                c.commit()
-            elif acts:
+            conn = sqlite3.connect(DB)
+            c = conn.cursor()
+
+            if acts:
                 last_id = str(acts[0]["id"])
-                if not c.execute("SELECT 1 FROM seen_acts WHERE id=?", (last_id,)).fetchone():
+                c.execute("SELECT 1 FROM seen_acts WHERE id=?", (last_id,))
+                if not c.fetchone():
                     c.execute("INSERT OR IGNORE INTO seen_acts VALUES (?)", (last_id,))
-                    c.commit()
+                    conn.commit()
                     ans = generate_ai(make_prompt(prof, well, acts, evts, f"Débrief séance : {acts[0]}"))
                     requests.post(url, json={"chat_id": TG_USER, "text": f"🏁 <b>Nouvelle séance détectée !</b>\n\n{ans}", "parse_mode": "HTML"}, timeout=10)
 
             if well:
                 last_d = well[0].get("d")
-                if last_d and well[0].get("sleep_h") and not c.execute("SELECT 1 FROM seen_well WHERE d=?", (last_d,)).fetchone():
-                    c.execute("INSERT OR IGNORE INTO seen_well VALUES (?)", (last_d,))
-                    c.commit()
-                    ans = generate_ai(make_prompt(prof, well, acts, evts, f"Brief réveil : {well[0]}"))
-                    requests.post(url, json={"chat_id": TG_USER, "text": f"☀️ <b>Réveil détecté</b>\n\n{ans}", "parse_mode": "HTML"}, timeout=10)
-            c.close()
+                if last_d and well[0].get("sleep_h"):
+                    c.execute("SELECT 1 FROM seen_well WHERE d=?", (last_d,))
+                    if not c.fetchone():
+                        c.execute("INSERT OR IGNORE INTO seen_well VALUES (?)", (last_d,))
+                        conn.commit()
+                        ans = generate_ai(make_prompt(prof, well, acts, evts, f"Brief réveil : {well[0]}"))
+                        requests.post(url, json={"chat_id": TG_USER, "text": f"☀️ <b>Réveil détecté</b>\n\n{ans}", "parse_mode": "HTML"}, timeout=10)
+            conn.close()
         except Exception:
             pass
-        time.sleep(900)
 
 if __name__ == "__main__":
     init_db()
-    print("Bot Coach Running prêt et connecté !")
+    print("Bot Coach Running démarré avec succès !")
     threading.Thread(target=bg_loop, daemon=True).start()
     app = ApplicationBuilder().token(TG_TOKEN).build()
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_text))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))
     app.run_polling()
+    
