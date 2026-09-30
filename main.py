@@ -180,7 +180,7 @@ def evaluate_injury_risk(wellness_list):
     if alerte_surcharge:
         warnings.append(f"ACWR élevé à {acwr} (seuil critique : 1.35)")
     if alerte_vrc:
-        warnings.append("VRC anormalement basse deux nuits de suite sous la référence")
+        warnings.append("VRC anormalement basse deux nuits consécutives sous la référence")
 
     return {
         "acwr": acwr,
@@ -308,13 +308,7 @@ def parse_relative_date(date_str: str) -> str:
     return s.split("T")[0]
 
 def planifier_seance(date_str: str = "", titre: str = "", description: str = "", heure: str = "18:00", **kwargs) -> str:
-    """Planifie une séance d'entraînement sur Intervals.icu.
-    Args:
-        date_str: Date au format AAAA-MM-JJ (ex: '2026-10-01' ou 'demain').
-        titre: Titre court de la séance.
-        description: Consignes d'allures, blocs et zones cibles.
-        heure: Heure au format HH:MM (défaut '18:00').
-    """
+    """Planifie une séance d'entraînement sur Intervals.icu."""
     d_val = date_str or kwargs.get("date") or kwargs.get("start_date") or datetime.date.today().isoformat()
     t_val = titre or kwargs.get("title") or kwargs.get("name") or "Séance Course"
     desc_val = description or kwargs.get("desc") or kwargs.get("details") or f"Séance : {t_val}"
@@ -337,11 +331,7 @@ def planifier_seance(date_str: str = "", titre: str = "", description: str = "",
         return f"Erreur connexion Intervals : {err}"
 
 def supprimer_seance(date_str: str = "", titre: str = "", **kwargs) -> str:
-    """Supprime une séance planifiée sur Intervals.icu.
-    Args:
-        date_str: Date de la séance (ex: '2026-09-30', 'today' ou 'demain').
-        titre: Titre ou mot clé de la séance (optionnel).
-    """
+    """Supprime une séance planifiée sur Intervals.icu."""
     d_val = date_str or kwargs.get("date") or kwargs.get("target_date") or datetime.date.today().isoformat()
     target_date = parse_relative_date(d_val)
 
@@ -379,13 +369,7 @@ def supprimer_seance(date_str: str = "", titre: str = "", **kwargs) -> str:
         return f"Erreur connexion Intervals : {err}"
 
 def deplacer_seance(date_origine: str = "", date_cible: str = "", titre: str = "", heure: str = "18:00", **kwargs) -> str:
-    """Déplace une séance existante vers une autre date sur Intervals.icu.
-    Args:
-        date_origine: Date actuelle de la séance (ex: 'today' ou '2026-09-30').
-        date_cible: Nouvelle date souhaitée (ex: 'demain' ou '2026-10-01').
-        titre: Titre ou mot clé de la séance à déplacer (optionnel).
-        heure: Heure cible au format HH:MM (défaut '18:00').
-    """
+    """Déplace une séance existante vers une autre date sur Intervals.icu."""
     d_orig = parse_relative_date(date_origine or kwargs.get("date_source") or datetime.date.today().isoformat())
     d_dest = parse_relative_date(date_cible or kwargs.get("target_date") or kwargs.get("date_destination") or "")
     clean_hour = heure if ":" in str(heure) else "18:00"
@@ -424,12 +408,7 @@ def deplacer_seance(date_origine: str = "", date_cible: str = "", titre: str = "
         return f"Erreur connexion Intervals : {err}"
 
 def gerer_indisponibilite(date_debut: str = "", date_fin: str = "", motif: str = "Repos forcé", **kwargs) -> str:
-    """Annule les séances d'entraînement sur une plage de dates en cas d'imprévu, maladie ou déplacement.
-    Args:
-        date_debut: Date de début au format AAAA-MM-JJ (ou 'today').
-        date_fin: Date de fin au format AAAA-MM-JJ (ou 'dimanche').
-        motif: Cause (ex: 'grippe', 'déplacement pro', 'coup de fatigue').
-    """
+    """Annule les séances d'entraînement sur une plage de dates en cas d'imprévu ou maladie."""
     d1 = parse_relative_date(date_debut or datetime.date.today().isoformat())
     d2 = parse_relative_date(date_fin or d1)
     if d1 > d2:
@@ -476,4 +455,27 @@ def generate_ai(prompt_parts, user_msg_raw=""):
                 args = dict(call.args) if call.args else {}
                 tool_res = fn(**args) if fn else "Action inconnue"
                 time.sleep(1)
-                conf_prompt 
+                conf_prompt = (
+                    f"Action exécutée : {tool_res}.\n"
+                    f"Demande initiale : '{user_msg_raw}'.\n"
+                    f"Confirme à l'athlète en HTML Telegram avec un ton de coach direct, encourageant et clair."
+                )
+                try:
+                    r_conf = ai_client.models.generate_content(model=MODEL_NAME, contents=conf_prompt)
+                    return r_conf.text
+                except Exception:
+                    return tool_res
+            if r and r.text:
+                return r.text
+        except Exception as e:
+            dernier_bug = str(e)
+            logging.error(f"Erreur generate_ai : {e}")
+            if "429" in dernier_bug or "RESOURCE_EXHAUSTED" in dernier_bug:
+                time.sleep(3)
+                continue
+            time.sleep(1.5)
+
+    return f"⚠️ Erreur détaillée : {dernier_bug}"
+
+def make_prompt(prof, weather, well, acts, evts, user_msg):
+    m
