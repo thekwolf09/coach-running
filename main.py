@@ -77,7 +77,6 @@ def fetch_wellness():
         r = requests.get(f"{BASE}/wellness", auth=AUTH, params={"oldest": old, "newest": today}, timeout=10)
         if r.status_code == 200:
             raw = r.json()
-            # Tri antéchronologique explicite : le plus récent en premier
             raw.sort(key=lambda x: str(x.get("id", "")), reverse=True)
             res = []
             for j in raw:
@@ -104,7 +103,6 @@ def fetch_activities():
         r = requests.get(f"{BASE}/activities", auth=AUTH, params={"oldest": old}, timeout=10)
         if r.status_code == 200:
             raw = r.json()
-            # Tri antéchronologique explicite avant de tronquer
             raw.sort(key=lambda x: str(x.get("start_date_local", "")), reverse=True)
             res = []
             for a in raw[:70]:
@@ -152,23 +150,20 @@ def get_all_data():
     f4 = POOL.submit(fetch_events)
     return f1.result(), f2.result(), f3.result(), f4.result()
 
-def planifier_seance(date_str: str = "", titre: str = "", description: str = "", heure: str = "18:00") -> str:
-    """Planifie une séance d'entraînement de course à pied sur Intervals.icu.
-    Args:
-        date_str: Date de la séance au format AAAA-MM-JJ (ex: '2026-09-30').
-        titre: Titre court de la séance.
-        description: Consignes d'allures, intensités et zones cibles.
-        heure: Heure de la séance au format HH:MM (défaut '18:00').
-    """
+def planifier_seance(date_str: str = "", titre: str = "", description: str = "", heure: str = "18:00", **kwargs) -> str:
+    """Planifie une séance d'entraînement sur Intervals.icu."""
+    d_val = date_str or kwargs.get("date") or kwargs.get("start_date") or datetime.date.today().isoformat()
+    t_val = titre or kwargs.get("title") or kwargs.get("name") or kwargs.get("titre_seance") or "Séance Course"
+    desc_val = description or kwargs.get("desc") or kwargs.get("details") or f"Séance : {t_val}"
     today_iso = datetime.date.today().isoformat()
-    target_date = today_iso if any(k in str(date_str).lower() for k in ["today", "aujourd", "soir", "ce soir"]) else str(date_str).split("T")[0]
-    clean_hour = heure if ":" in heure else "18:00"
+    target_date = today_iso if any(k in str(d_val).lower() for k in ["today", "aujourd", "soir", "ce soir"]) else str(d_val).split("T")[0]
+    clean_hour = heure if ":" in str(heure) else "18:00"
 
     payload = {
         "category": "WORKOUT",
         "type": "Run",
-        "name": titre or "Séance Course",
-        "description": description or f"Séance : {titre}",
+        "name": t_val,
+        "description": desc_val,
         "start_date_local": f"{target_date}T{clean_hour}:00"
     }
     try:
@@ -179,14 +174,11 @@ def planifier_seance(date_str: str = "", titre: str = "", description: str = "",
     except Exception as err:
         return f"Erreur de connexion Intervals : {err}"
 
-def supprimer_seance(date_str: str = "", titre: str = "") -> str:
-    """Supprime une séance planifiée sur Intervals.icu.
-    Args:
-        date_str: Date de la séance au format AAAA-MM-JJ (ex: '2026-09-30' ou 'today').
-        titre: Titre ou mot clé de la séance à supprimer.
-    """
+def supprimer_seance(date_str: str = "", titre: str = "", **kwargs) -> str:
+    """Supprime une séance planifiée sur Intervals.icu."""
+    d_val = date_str or kwargs.get("date") or kwargs.get("target_date") or datetime.date.today().isoformat()
     today_iso = datetime.date.today().isoformat()
-    target_date = today_iso if any(k in str(date_str).lower() for k in ["today", "aujourd", "ce jour", "soir"]) else str(date_str).split("T")[0]
+    target_date = today_iso if any(k in str(d_val).lower() for k in ["today", "aujourd", "ce jour", "soir"]) else str(d_val).split("T")[0]
 
     try:
         r = requests.get(f"{BASE}/events", auth=AUTH, params={"oldest": target_date, "newest": target_date}, timeout=8)
@@ -198,10 +190,10 @@ def supprimer_seance(date_str: str = "", titre: str = "") -> str:
             return f"Aucune séance trouvée sur Intervals.icu le {target_date}."
 
         target_event = None
-        t_clean = (titre or "").strip().lower()
+        t_clean = (titre or kwargs.get("name") or kwargs.get("title") or "").strip().lower()
         if t_clean:
             for ev in events:
-                if t_clean in ev.get("name", "").lower():
+                if t_clean in str(ev.get("name", "")).lower():
                     target_event = ev
                     break
 
@@ -226,16 +218,12 @@ def generate_ai(prompt_parts, user_msg_raw=""):
         "planifier_seance": planifier_seance,
         "supprimer_seance": supprimer_seance
     }
-    tool_executed_msg = None
-
-    # Configuration avec désactivation de l'Automatic Function Calling interne
+    dernier_bug = ""
     cfg = types.GenerateContentConfig(
         tools=[planifier_seance, supprimer_seance],
-        temperature=0.3,
-        automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True)
+        temperature=0.3
     )
 
-    # 1. Détection et exécution de l'outil (une seule fois)
     for _ in range(3):
         try:
             r = ai_client.models.generate_content(model=MODEL_NAME, contents=prompt_parts, config=cfg)
@@ -243,32 +231,26 @@ def generate_ai(prompt_parts, user_msg_raw=""):
                 call = r.function_calls[0]
                 fn = tools_map.get(call.name)
                 args = dict(call.args) if call.args else {}
-                tool_executed_msg = fn(**args) if fn else "Action inconnue"
-                break
+                tool_res = fn(**args) if fn else "Action inconnue"
+                time.sleep(1)
+                conf_prompt = (
+                    f"Action exécutée : {tool_res}.\n"
+                    f"Demande initiale : '{user_msg_raw}'.\n"
+                    f"Confirme à l'athlète en HTML Telegram avec un ton direct et bienveillant."
+                )
+                r_conf = ai_client.models.generate_content(model=MODEL_NAME, contents=conf_prompt)
+                return r_conf.text
             if r and r.text:
                 return r.text
         except Exception as e:
-            err_str = str(e)
-            if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
+            dernier_bug = str(e)
+            logging.error(f"Erreur generate_ai: {e}")
+            if "429" in dernier_bug or "RESOURCE_EXHAUSTED" in dernier_bug:
                 time.sleep(3)
                 continue
-            logging.error(f"Erreur generate_ai: {e}")
             time.sleep(1.5)
 
-    # 2. Confirmation formatée pour Telegram si un outil a tourné
-    if tool_executed_msg:
-        conf_prompt = (
-            f"Action effectuée : {tool_executed_msg}.\n"
-            f"Demande initiale : '{user_msg_raw}'.\n"
-            f"Confirme à l'athlète en HTML Telegram avec un ton direct et bienveillant."
-        )
-        try:
-            r_conf = ai_client.models.generate_content(model=MODEL_NAME, contents=conf_prompt)
-            return r_conf.text
-        except Exception:
-            return tool_executed_msg
-
-    return "⚠️ Service momentanément indisponible, réessaie dans un instant."
+    return f"⚠️ Erreur détaillée : {dernier_bug}"
 
 def make_prompt(prof, well, acts, evts, user_msg):
     mem = get_notes()
@@ -300,7 +282,6 @@ async def send_reply(cid, text, bot):
     try:
         await bot.send_message(chat_id=cid, text=text, parse_mode=ParseMode.HTML)
     except Exception:
-        # Nettoyage des balises si Telegram rejette le HTML
         clean_text = re.sub(r'<[^>]+>', '', text)
         await bot.send_message(chat_id=cid, text=clean_text)
 
@@ -354,7 +335,6 @@ def bg_loop():
             c = conn.cursor()
 
             if acts:
-                # Boucle sur les activités non vues
                 for a in acts:
                     act_id = str(a["id"])
                     c.execute("SELECT 1 FROM seen_acts WHERE id=?", (act_id,))
