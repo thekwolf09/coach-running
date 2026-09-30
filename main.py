@@ -127,7 +127,7 @@ def planifier_seance(date_str: str, titre: str, description: str = "") -> str:
         r = requests.post(f"{BASE}/events", auth=AUTH, headers=headers, json=payload, timeout=8)
         if r.status_code in (200, 201):
             return f"Séance '{titre}' ajoutée sur Intervals.icu pour le {date_str}."
-        return f"Erreur retour Intervals ({r.status_code}) : {r.text}"
+                return f"Erreur retour Intervals ({r.status_code})"
     except Exception as err:
         return f"Erreur de connexion Intervals : {err}"
 
