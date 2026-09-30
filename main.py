@@ -115,78 +115,77 @@ def get_all_data():
     f4 = POOL.submit(fetch_events)
     return f1.result(), f2.result(), f3.result(), f4.result()
 
-def modifier_ou_creer_seance(date_str: str, titre: str, description_workout: str = "", event_id: int = None) -> str:
+def planifier_seance(date_str: str, titre: str, description: str = "") -> str:
+    """Planifie une séance d'entraînement course à pied sur Intervals.icu.
+    Args:
+        date_str: Date de la séance au format AAAA-MM-JJ (ex: '2026-09-30').
+        titre: Titre court de la séance (ex: 'Footing EF 25 min').
+        description: Consignes d'allures, zones cardiaques et durée.
+    """
     headers = {"Content-Type": "application/json"}
-    heure = "18:00:00" if "T" not in date_str else ""
-    date_val = f"{date_str}T{heure}" if heure else date_str
-    data = {
+    date_val = f"{date_str}T18:00:00" if "T" not in date_str else date_str
+    payload = {
         "category": "WORKOUT",
         "type": "Run",
         "name": titre,
-        "description": description_workout,
+        "description": description,
         "start_date_local": date_val
     }
     try:
-        if event_id:
-            r = requests.put(f"{BASE}/events/{event_id}", auth=AUTH, headers=headers, json=data, timeout=8)
-        else:
-            r = requests.post(f"{BASE}/events", auth=AUTH, headers=headers, json=data, timeout=8)
+        r = requests.post(f"{BASE}/events", auth=AUTH, headers=headers, json=payload, timeout=8)
         if r.status_code in (200, 201):
             return f"Séance '{titre}' ajoutée sur Intervals.icu pour le {date_str}."
-        return f"Statut Intervals.icu: {r.status_code}"
-    except Exception as e:
-        return f"Erreur de connexion Intervals: {e}"
+        return f"Statut Intervals.icu : {r.status_code}"
+    except Exception as err:
+        return f"Erreur Intervals.icu : {err}"
 
 def generate_ai(prompt_parts, user_msg_raw=""):
-    models = ["gemini-2.5-flash", "gemini-3.8-flash"]
+    models = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
     for m in models:
         try:
-            cfg = types.GenerateContentConfig(
-                tools=[modifier_ou_creer_seance],
-                temperature=0.3
-            )
+            cfg = types.GenerateContentConfig(tools=[planifier_seance], temperature=0.3)
             r = ai_client.models.generate_content(model=m, contents=prompt_parts, config=cfg)
-            
             if r.function_calls:
                 call = r.function_calls[0]
                 args = call.args or {}
-                tool_res = modifier_ou_creer_seance(**args)
-                
-                consigne_suivi = (
-                    f"Tu viens d'exécuter l'action suivante : {tool_res}.\n"
-                    f"Détails : {json.dumps(args, ensure_ascii=False)}.\n"
-                    f"Demande initiale de l'athlète : '{user_msg_raw}'.\n"
-                    f"Confirme-lui avec enthousiasme en format HTML Telegram que la séance est enregistrée "
-                    f"et donne-lui un bref conseil pour cette sortie (allure et récupération)."
+                tool_res = planifier_seance(**args)
+                conf = (
+                    f"Action exécutée : {tool_res}.\n"
+                    f"Demande de l'athlète : '{user_msg_raw}'.\n"
+                    f"Confirme à l'athlète en HTML Telegram avec un court conseil d'allure."
                 )
-                r_conf = ai_client.models.generate_content(model=m, contents=consigne_suivi)
-                return r_conf.text
-                
+                return ai_client.models.generate_content(model=m, contents=conf).text
             if r and r.text:
                 return r.text
         except Exception:
-            time.sleep(1)
+            try:
+                r_fallback = ai_client.models.generate_content(model=m, contents=prompt_parts)
+                if r_fallback and r_fallback.text:
+                    return r_fallback.text
+            except Exception:
+                pass
             continue
-    return "Service temporairement indisponible, réessaie dans un instant."
+    return "Service temporairement indisponible côté Google, réessaie dans un instant."
 
 def make_prompt(prof, well, acts, evts, user_msg):
     mem = get_notes()
     consignes = (
         "Consignes :\n"
-        "1. Analyse croisee (6 mois passes, nuit actuelle, 13 semaines a venir).\n"
-        "2. FORMAT HTML TELEGRAM : utilise <b>Texte en gras</b> pour les allures et chiffres cles. Lignes vides pour aerer. Pas de dieses ni d'asterisques.\n"
-        "3. Si un fait durable est mentionne, ecris en fin de message : [MEMOIRE] note a enregistrer"
+        "1. Analyse croisée complète (6 mois passés, nuit actuelle, 13 semaines à venir).\n"
+        "2. FORMAT HTML TELEGRAM : utilise <b>Texte en gras</b> pour les allures et chiffres clés. Lignes vides pour aérer. Pas de dièses (#) ni d'astérisques (**).\n"
+        "3. Si un fait durable est mentionné, écris en fin de message : [MEMOIRE] note à enregistrer\n"
+        "4. Si l'athlète demande d'ajouter ou planifier une séance, utilise la fonction 'planifier_seance'."
     )
     return (
-        f"Tu es l'entraineur d'athletisme de ce coureur (objectif 5km sub-20, cible 3'59/km au 13/12/2026).\n"
+        f"Tu es l'entraîneur d'athlétisme personnel de ce coureur (objectif prioritaire : 5 km sub-20, cible 3'59/km au 13/12/2026).\n"
         f"Date du jour : {datetime.date.today().isoformat()}.\n\n"
-        f"PROFIL: {json.dumps(prof)}\n"
-        f"MEMOIRE: {json.dumps(mem)}\n"
-        f"SANTE 6 MOIS: {json.dumps(well)}\n"
-        f"SEANCES 6 MOIS: {json.dumps(acts)}\n"
-        f"PLAN 13 SEMAINES: {json.dumps(evts)}\n\n"
+        f"PROFIL ATHLÈTE : {json.dumps(prof, ensure_ascii=False)}\n"
+        f"MÉMOIRE DURABLE (Base SQLite) : {json.dumps(mem, ensure_ascii=False)}\n"
+        f"SANTÉ SUR 6 MOIS : {json.dumps(well, ensure_ascii=False)}\n"
+        f"SÉANCES SUR 6 MOIS : {json.dumps(acts, ensure_ascii=False)}\n"
+        f"PLAN SUR 13 SEMAINES : {json.dumps(evts, ensure_ascii=False)}\n\n"
         f"{consignes}\n\n"
-        f"MESSAGE DE L'ATHLETE :\n\"{user_msg}\""
+        f"MESSAGE DE L'ATHLÈTE :\n\"{user_msg}\""
     )
 
 async def send_reply(cid, text, bot):
@@ -218,7 +217,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     buf = io.BytesIO()
     await f.download_to_memory(buf)
     prof, well, acts, evts = get_all_data()
-    prompt = [make_prompt(prof, well, acts, evts, "Message vocal"), types.Part.from_bytes(data=buf.getvalue(), mime_type="audio/ogg")]
+    prompt = [make_prompt(prof, well, acts, evts, "Message vocal de l'athlète"), types.Part.from_bytes(data=buf.getvalue(), mime_type="audio/ogg")]
     ans = generate_ai(prompt, user_msg_raw="Message vocal")
     await send_reply(update.effective_chat.id, ans, context.bot)
 
@@ -234,7 +233,29 @@ def bg_loop():
                 if not c.execute("SELECT 1 FROM seen_acts WHERE id=?", (last_id,)).fetchone():
                     c.execute("INSERT OR IGNORE INTO seen_acts VALUES (?)", (last_id,))
                     c.commit()
-                    ans = generate_ai(make_prompt(prof, well, acts, evts, f"Nouvelle seance: {acts[0]}"))
+                    ans = generate_ai(make_prompt(prof, well, acts, evts, f"Nouvelle séance détectée : {acts[0]}"))
+                    requests.post(url, json={"chat_id": TG_USER, "text": f"🏁 <b>Nouvelle séance détectée !</b>\n\n{ans}", "parse_mode": "HTML"}, timeout=10)
+            if well:
+                last_d = well[0].get("d")
+                if last_d and well[0].get("sleep_h") and not c.execute("SELECT 1 FROM seen_well WHERE d=?", (last_d,)).fetchone():
+                    c.execute("INSERT OR IGNORE INTO seen_well VALUES (?)", (last_d,))
+                    c.commit()
+                    ans = generate_ai(make_prompt(prof, well, acts, evts, f"Réveil enregistré : {well[0]}"))
+                    requests.post(url, json={"chat_id": TG_USER, "text": f"☀️ <b>Réveil détecté</b>\n\n{ans}", "parse_mode": "HTML"}, timeout=10)
+            c.close()
+        except Exception:
+            pass
+        time.sleep(900)
+
+if __name__ == "__main__":
+    init_db()
+    print("Coach Running prêt et connecté !")
+    threading.Thread(target=bg_loop, daemon=True).start()
+    app = ApplicationBuilder().token(TG_TOKEN).build()
+    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_text))
+    app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))
+    app.run_polling()
+            ans = generate_ai(make_prompt(prof, well, acts, evts, f"Nouvelle seance: {acts[0]}"))
                     requests.post(url, json={"chat_id": TG_USER, "text": f"<b>Nouvelle séance détectée !</b>\n\n{ans}", "parse_mode": "HTML"}, timeout=10)
             if well:
                 last_d = well[0].get("d")
