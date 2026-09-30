@@ -30,7 +30,7 @@ ai_client = genai.Client(api_key=GEMINI_KEY)
 AUTH = HTTPBasicAuth("API_KEY", INTERVALS_KEY)
 BASE = f"https://intervals.icu/api/v1/athlete/{ATHLETE_ID}"
 DB = "coach_brain.db"
-POOL = ThreadPoolExecutor(max_workers=4)
+POOL = ThreadPoolExecutor(max_workers=5)
 
 def init_db():
     conn = sqlite3.connect(DB)
@@ -38,6 +38,7 @@ def init_db():
     c.execute("CREATE TABLE IF NOT EXISTS notes (id INTEGER PRIMARY KEY AUTOINCREMENT, d TEXT, txt TEXT)")
     c.execute("CREATE TABLE IF NOT EXISTS seen_acts (id TEXT PRIMARY KEY)")
     c.execute("CREATE TABLE IF NOT EXISTS seen_well (d TEXT PRIMARY KEY)")
+    c.execute("CREATE TABLE IF NOT EXISTS chat_history (id INTEGER PRIMARY KEY AUTOINCREMENT, role TEXT, txt TEXT, d TEXT)")
     conn.commit()
     conn.close()
 
@@ -56,6 +57,21 @@ def get_notes():
     conn.close()
     return [{"date": r[0], "note": r[1]} for r in reversed(rows)]
 
+def save_chat_msg(role: str, text: str):
+    conn = sqlite3.connect(DB)
+    c = conn.cursor()
+    c.execute("INSERT INTO chat_history (role, txt, d) VALUES (?, ?, ?)", (role, text, datetime.datetime.now().isoformat()))
+    conn.commit()
+    conn.close()
+
+def get_chat_history(limit: int = 6):
+    conn = sqlite3.connect(DB)
+    c = conn.cursor()
+    c.execute("SELECT role, txt FROM chat_history ORDER BY id DESC LIMIT ?", (limit,))
+    rows = c.fetchall()
+    conn.close()
+    return [{"role": r[0], "text": r[1]} for r in reversed(rows)]
+
 def fetch_profile():
     try:
         r = requests.get(BASE, auth=AUTH, timeout=8)
@@ -64,17 +80,58 @@ def fetch_profile():
             return {
                 "zones": d.get("icu_hr_zones"),
                 "lthr": d.get("icu_lthr"),
-                "weight": d.get("weight")
+                "weight": d.get("weight"),
+                "city": d.get("city"),
+                "country": d.get("country"),
+                "timezone": d.get("timezone")
             }
     except Exception as err:
         logging.error(f"Erreur fetch_profile: {err}")
     return {}
 
-def fetch_wellness():
-    today = datetime.date.today().isoformat()
-    old = (datetime.date.today() - datetime.timedelta(days=180)).isoformat()
+def fetch_weather(city_name: str = ""):
+    target_city = city_name.strip() or "Melbourne"
     try:
-        r = requests.get(f"{BASE}/wellness", auth=AUTH, params={"oldest": old, "newest": today}, timeout=10)
+        geo_r = requests.get(
+            f"https://geocoding-api.open-meteo.com/v1/search?name={target_city}&count=1&language=fr&format=json",
+            timeout=6
+        )
+        if geo_r.status_code == 200 and geo_r.json().get("results"):
+            geo = geo_r.json()["results"][0]
+            lat, lon = geo["latitude"], geo["longitude"]
+            nom_ville = geo.get("name", target_city)
+
+            w_url = (
+                f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}"
+                f"&current=temperature_2m,apparent_temperature,precipitation,wind_speed_10m"
+                f"&daily=temperature_2m_max,temperature_2m_min,precipitation_probability_max"
+                f"&timezone=auto"
+            )
+            w_r = requests.get(w_url, timeout=6)
+            if w_r.status_code == 200:
+                data = w_r.json()
+                cur = data.get("current", {})
+                daily = data.get("daily", {})
+                return {
+                    "ville": nom_ville,
+                    "temp_actuelle": f"{cur.get('temperature_2m')}°C",
+                    "ressenti": f"{cur.get('apparent_temperature')}°C",
+                    "vent": f"{cur.get('wind_speed_10m')} km/h",
+                    "pluie_actuelle": f"{cur.get('precipitation')} mm",
+                    "temp_max_jour": f"{daily.get('temperature_2m_max', ['?'])[0]}°C",
+                    "temp_min_jour": f"{daily.get('temperature_2m_min', ['?'])[0]}°C",
+                    "probabilite_pluie": f"{daily.get('precipitation_probability_max', ['0'])[0]}%"
+                }
+    except Exception as err:
+        logging.error(f"Erreur fetch_weather: {err}")
+    return {"info": "Météo non disponible"}
+
+def fetch_wellness():
+    today = datetime.date.today()
+    d90 = (today - datetime.timedelta(days=90)).isoformat()
+    today_iso = today.isoformat()
+    try:
+        r = requests.get(f"{BASE}/wellness", auth=AUTH, params={"oldest": d90, "newest": today_iso}, timeout=10)
         if r.status_code == 200:
             raw = r.json()
             raw.sort(key=lambda x: str(x.get("id", "")), reverse=True)
@@ -98,38 +155,75 @@ def fetch_wellness():
     return []
 
 def fetch_activities():
-    old = (datetime.date.today() - datetime.timedelta(days=180)).isoformat()
+    today = datetime.date.today()
+    d180 = (today - datetime.timedelta(days=180)).isoformat()
+    d90 = (today - datetime.timedelta(days=90)).isoformat()
     try:
-        r = requests.get(f"{BASE}/activities", auth=AUTH, params={"oldest": old}, timeout=10)
+        r = requests.get(f"{BASE}/activities", auth=AUTH, params={"oldest": d180}, timeout=10)
         if r.status_code == 200:
             raw = r.json()
             raw.sort(key=lambda x: str(x.get("start_date_local", "")), reverse=True)
-            res = []
-            for a in raw[:70]:
+            
+            raw_3months = []
+            older_acts = []
+
+            for a in raw:
+                d_str = str(a.get("start_date_local", ""))[:10]
                 spd = a.get("average_speed") or 0
                 dist = a.get("distance") or 0
                 mtime = a.get("moving_time") or 0
                 pace = f"{int((1000/spd)//60)}'{int((1000/spd)%60):02d}\"/km" if spd > 0 else None
-                res.append({
+                item = {
                     "id": a.get("id"),
-                    "d": str(a.get("start_date_local", ""))[:10],
+                    "d": d_str,
                     "nom": a.get("name"),
                     "km": round(dist / 1000, 2),
                     "min": round(mtime / 60, 1),
                     "pace": pace,
                     "hr": a.get("average_heartrate"),
                     "load": a.get("icu_training_load")
-                })
-            return res
+                }
+                if d_str >= d90:
+                    raw_3months.append(item)
+                else:
+                    older_acts.append(item)
+
+            weeks = {}
+            for a in older_acts:
+                dt = datetime.datetime.strptime(a["d"], "%Y-%m-%d").date()
+                w_key = f"{dt.year}-S{dt.isocalendar()[1]:02d}"
+                if w_key not in weeks:
+                    weeks[w_key] = {"km": 0.0, "min": 0.0, "load": 0, "count": 0}
+                weeks[w_key]["km"] += a["km"]
+                weeks[w_key]["min"] += a["min"]
+                weeks[w_key]["load"] += (a["load"] or 0)
+                weeks[w_key]["count"] += 1
+
+            weekly_summary = [
+                {
+                    "semaine": k,
+                    "seances": v["count"],
+                    "km_total": round(v["km"], 1),
+                    "temps_h": round(v["min"] / 60, 1),
+                    "charge_totale": v["load"]
+                }
+                for k, v in sorted(weeks.items(), reverse=True)
+            ]
+
+            return {
+                "brut_3_mois": raw_3months,
+                "agregat_semaines_3_a_6_mois": weekly_summary
+            }
     except Exception as err:
         logging.error(f"Erreur fetch_activities: {err}")
-    return []
+    return {"brut_3_mois": [], "agregat_semaines_3_a_6_mois": []}
 
 def fetch_events():
-    today = datetime.date.today().isoformat()
-    fut = (datetime.date.today() + datetime.timedelta(days=91)).isoformat()
+    today = datetime.date.today()
+    past_180 = (today - datetime.timedelta(days=180)).isoformat()
+    fut_90 = (today + datetime.timedelta(days=90)).isoformat()
     try:
-        r = requests.get(f"{BASE}/events", auth=AUTH, params={"oldest": today, "newest": fut}, timeout=8)
+        r = requests.get(f"{BASE}/events", auth=AUTH, params={"oldest": past_180, "newest": fut_90}, timeout=10)
         if r.status_code == 200:
             raw = r.json()
             raw.sort(key=lambda x: str(x.get("start_date_local", "")))
@@ -137,26 +231,45 @@ def fetch_events():
                 "id": e.get("id"),
                 "d": str(e.get("start_date_local", ""))[:10],
                 "nom": e.get("name"),
-                "desc": e.get("description")
-            } for e in raw]
+                "desc": e.get("description"),
+                "category": e.get("category")
+            } for e in raw if e.get("category") == "WORKOUT"]
     except Exception as err:
         logging.error(f"Erreur fetch_events: {err}")
     return []
 
 def get_all_data():
-    f1 = POOL.submit(fetch_profile)
-    f2 = POOL.submit(fetch_wellness)
-    f3 = POOL.submit(fetch_activities)
-    f4 = POOL.submit(fetch_events)
-    return f1.result(), f2.result(), f3.result(), f4.result()
+    prof = fetch_profile()
+    city = prof.get("city") or "Melbourne"
+    f_weather = POOL.submit(fetch_weather, city)
+    f_well = POOL.submit(fetch_wellness)
+    f_acts = POOL.submit(fetch_activities)
+    f_evts = POOL.submit(fetch_events)
+    return prof, f_weather.result(), f_well.result(), f_acts.result(), f_evts.result()
+
+def parse_relative_date(date_str: str) -> str:
+    s = str(date_str).lower().strip()
+    today = datetime.date.today()
+    if any(k in s for k in ["demain", "tomorrow"]):
+        return (today + datetime.timedelta(days=1)).isoformat()
+    if any(k in s for k in ["hier", "yesterday"]):
+        return (today - datetime.timedelta(days=1)).isoformat()
+    if any(k in s for k in ["today", "aujourd", "soir", "ce soir", "ce jour"]):
+        return today.isoformat()
+    return s.split("T")[0]
 
 def planifier_seance(date_str: str = "", titre: str = "", description: str = "", heure: str = "18:00", **kwargs) -> str:
-    """Planifie une séance d'entraînement sur Intervals.icu."""
+    """Planifie une séance d'entraînement sur Intervals.icu.
+    Args:
+        date_str: Date au format AAAA-MM-JJ (ex: '2026-10-01' ou 'demain').
+        titre: Titre court de la séance.
+        description: Consignes d'allures, blocs et zones cibles.
+        heure: Heure au format HH:MM (défaut '18:00').
+    """
     d_val = date_str or kwargs.get("date") or kwargs.get("start_date") or datetime.date.today().isoformat()
-    t_val = titre or kwargs.get("title") or kwargs.get("name") or kwargs.get("titre_seance") or "Séance Course"
+    t_val = titre or kwargs.get("title") or kwargs.get("name") or "Séance Course"
     desc_val = description or kwargs.get("desc") or kwargs.get("details") or f"Séance : {t_val}"
-    today_iso = datetime.date.today().isoformat()
-    target_date = today_iso if any(k in str(d_val).lower() for k in ["today", "aujourd", "soir", "ce soir"]) else str(d_val).split("T")[0]
+    target_date = parse_relative_date(d_val)
     clean_hour = heure if ":" in str(heure) else "18:00"
 
     payload = {
@@ -172,13 +285,16 @@ def planifier_seance(date_str: str = "", titre: str = "", description: str = "",
             return f"Séance '{payload['name']}' planifiée le {target_date} à {clean_hour} sur Intervals.icu."
         return f"Erreur Intervals.icu ({r.status_code}) : {r.text}"
     except Exception as err:
-        return f"Erreur de connexion Intervals : {err}"
+        return f"Erreur connexion Intervals : {err}"
 
 def supprimer_seance(date_str: str = "", titre: str = "", **kwargs) -> str:
-    """Supprime une séance planifiée sur Intervals.icu."""
+    """Supprime une séance planifiée sur Intervals.icu.
+    Args:
+        date_str: Date de la séance (ex: '2026-09-30', 'today' ou 'demain').
+        titre: Titre ou mot clé de la séance (optionnel).
+    """
     d_val = date_str or kwargs.get("date") or kwargs.get("target_date") or datetime.date.today().isoformat()
-    today_iso = datetime.date.today().isoformat()
-    target_date = today_iso if any(k in str(d_val).lower() for k in ["today", "aujourd", "ce jour", "soir"]) else str(d_val).split("T")[0]
+    target_date = parse_relative_date(d_val)
 
     try:
         r = requests.get(f"{BASE}/events", auth=AUTH, params={"oldest": target_date, "newest": target_date}, timeout=8)
@@ -211,16 +327,64 @@ def supprimer_seance(date_str: str = "", titre: str = "", **kwargs) -> str:
             return f"La séance '{ev_nom}' du {target_date} a bien été supprimée de ton calendrier."
         return f"Erreur suppression Intervals ({del_r.status_code})."
     except Exception as err:
-        return f"Erreur de connexion Intervals : {err}"
+        return f"Erreur connexion Intervals : {err}"
+
+def deplacer_seance(date_origine: str = "", date_cible: str = "", titre: str = "", heure: str = "18:00", **kwargs) -> str:
+    """Déplace une séance existante vers une autre date sur Intervals.icu.
+    Args:
+        date_origine: Date actuelle de la séance (ex: 'today' ou '2026-09-30').
+        date_cible: Nouvelle date souhaitée (ex: 'demain' ou '2026-10-01').
+        titre: Titre ou mot clé de la séance à déplacer (optionnel).
+        heure: Heure cible au format HH:MM (défaut '18:00').
+    """
+    d_orig = parse_relative_date(date_origine or kwargs.get("date_source") or datetime.date.today().isoformat())
+    d_dest = parse_relative_date(date_cible or kwargs.get("target_date") or kwargs.get("date_destination") or "")
+    clean_hour = heure if ":" in str(heure) else "18:00"
+
+    if not d_dest:
+        return "Précise vers quelle date déplacer la séance."
+
+    try:
+        r = requests.get(f"{BASE}/events", auth=AUTH, params={"oldest": d_orig, "newest": d_orig}, timeout=8)
+        if r.status_code != 200:
+            return f"Erreur lecture calendrier ({r.status_code})."
+
+        events = [e for e in r.json() if e.get("category") == "WORKOUT"]
+        if not events:
+            return f"Aucune séance trouvée à déplacer le {d_orig}."
+
+        target_event = None
+        t_clean = (titre or kwargs.get("name") or kwargs.get("title") or "").strip().lower()
+        if t_clean:
+            for ev in events:
+                if t_clean in str(ev.get("name", "")).lower():
+                    target_event = ev
+                    break
+
+        if not target_event:
+            target_event = events[0]
+
+        ev_id = target_event.get("id")
+        ev_nom = target_event.get("name", "Séance")
+        payload = {
+            "start_date_local": f"{d_dest}T{clean_hour}:00"
+        }
+        put_r = requests.put(f"{BASE}/events/{ev_id}", auth=AUTH, json=payload, timeout=8)
+        if put_r.status_code in (200, 204):
+            return f"La séance '{ev_nom}' a été déplacée du {d_orig} au {d_dest} à {clean_hour}."
+        return f"Erreur lors du déplacement sur Intervals ({put_r.status_code}) : {put_r.text}"
+    except Exception as err:
+        return f"Erreur connexion Intervals : {err}"
 
 def generate_ai(prompt_parts, user_msg_raw=""):
     tools_map = {
         "planifier_seance": planifier_seance,
-        "supprimer_seance": supprimer_seance
+        "supprimer_seance": supprimer_seance,
+        "deplacer_seance": deplacer_seance
     }
     dernier_bug = ""
     cfg = types.GenerateContentConfig(
-        tools=[planifier_seance, supprimer_seance],
+        tools=[planifier_seance, supprimer_seance, deplacer_seance],
         temperature=0.3
     )
 
@@ -252,24 +416,36 @@ def generate_ai(prompt_parts, user_msg_raw=""):
 
     return f"⚠️ Erreur détaillée : {dernier_bug}"
 
-def make_prompt(prof, well, acts, evts, user_msg):
+def make_prompt(prof, weather, well, acts, evts, user_msg):
     mem = get_notes()
+    chat_hist = get_chat_history(6)
+
+    today_str = datetime.date.today().isoformat()
     consignes = (
-        "Consignes d'analyse :\n"
-        "1. Analyse croisée complète : données récentes en priorité (les listes sont triées du plus récent au plus ancien).\n"
-        "2. FORMAT HTML TELEGRAM : utilise <b>Texte en gras</b> pour les allures et chiffres clés. "
-        "Aère avec des lignes vides. Pas de balises Markdown (# ou **).\n"
-        "3. Si un fait durable est mentionné, écris en fin de message : [MEMOIRE] note à enregistrer\n"
-        "4. Si l'athlète demande d'ajouter ou supprimer une séance, appelle obligatoirement planifier_seance ou supprimer_seance."
+        "Consignes d'entraînement et d'analyse :\n"
+        "1. Contexte temporel : les listes récentes sont triées de la plus récente à la plus ancienne. "
+        "Les agrégats 3-6 mois te permettent de comparer le niveau actuel avec les cycles précédents.\n"
+        "2. Météo : tiens compte de la météo pour conseiller l'horaire de course ou adapter l'allure si forte chaleur ou vent.\n"
+        "3. HISTORIQUE DE CONVERSATION : sers-toi des derniers messages échangés pour comprendre les pronoms "
+        "('celle-ci', 'la séance', 'demain').\n"
+        "4. OUTILS CALENDRIER : si l'athlète demande d'ajouter, décaler ou supprimer une séance, appelle "
+        "obligatoirement planifier_seance, deplacer_seance ou supprimer_seance.\n"
+        "5. FORMAT HTML TELEGRAM : utilise <b>Texte en gras</b> pour les chiffres clés et allures. "
+        "Aère avec des lignes vides. Pas de Markdown (# ou **).\n"
+        "6. Si un fait durable est mentionné, écris en fin de message : [MEMOIRE] note à enregistrer"
     )
+
     return (
-        f"Tu es l'entraîneur personnel de ce coureur (objectif prioritaire : 5 km sub-20, cible 3'59/km au 13/12/2026).\n"
-        f"Date du jour : {datetime.date.today().isoformat()}.\n\n"
+        f"Tu es l'entraîneur d'athlétisme personnel de ce coureur (objectif prioritaire : 5 km sub-20, cible 3'59/km au 13/12/2026).\n"
+        f"Date du jour : {today_str}.\n\n"
+        f"MÉTÉO DU JOUR : {json.dumps(weather, ensure_ascii=False)}\n"
         f"PROFIL ATHLÈTE : {json.dumps(prof, ensure_ascii=False)}\n"
-        f"MÉMOIRE DURABLE : {json.dumps(mem, ensure_ascii=False)}\n"
-        f"SANTÉ (du plus récent au plus ancien) : {json.dumps(well, ensure_ascii=False)}\n"
-        f"SÉANCES (du plus récent au plus ancien) : {json.dumps(acts, ensure_ascii=False)}\n"
-        f"CALENDRIER À VENIR : {json.dumps(evts, ensure_ascii=False)}\n\n"
+        f"HISTORIQUE RÉCENT CONVERSATION : {json.dumps(chat_hist, ensure_ascii=False)}\n"
+        f"MÉMOIRE DURABLE (Notes clés) : {json.dumps(mem, ensure_ascii=False)}\n"
+        f"SANTÉ 3 DERNIERS MOIS (brut) : {json.dumps(well, ensure_ascii=False)}\n"
+        f"ACTIVITÉS 3 DERNIERS MOIS (brut) : {json.dumps(acts.get('brut_3_mois', []), ensure_ascii=False)}\n"
+        f"ACTIVITÉS 3 À 6 MOIS (agrégats hebdo) : {json.dumps(acts.get('agregat_semaines_3_a_6_mois', []), ensure_ascii=False)}\n"
+        f"CALENDRIER (programmes passés 6 mois + prévisionnel 3 mois) : {json.dumps(evts, ensure_ascii=False)}\n\n"
         f"{consignes}\n\n"
         f"MESSAGE DE L'ATHLÈTE :\n\"{user_msg}\""
     )
@@ -279,90 +455,5 @@ async def send_reply(cid, text, bot):
         parts = text.split("[MEMOIRE]")
         text = parts[0].strip()
         save_note(parts[1].strip().split("\n")[0])
-    try:
-        await bot.send_message(chat_id=cid, text=text, parse_mode=ParseMode.HTML)
-    except Exception:
-        clean_text = re.sub(r'<[^>]+>', '', text)
-        await bot.send_message(chat_id=cid, text=clean_text)
-
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != TG_USER:
-        return
-    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
-    msg = update.message.text
-    prof, well, acts, evts = await asyncio.to_thread(get_all_data)
-    prompt = make_prompt(prof, well, acts, evts, msg)
-    ans = await asyncio.to_thread(generate_ai, prompt, user_msg_raw=msg)
-    await send_reply(update.effective_chat.id, ans, context.bot)
-
-async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != TG_USER:
-        return
-    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.RECORD_VOICE)
-    v = update.message.voice or update.message.audio
-    f = await context.bot.get_file(v.file_id)
-    buf = io.BytesIO()
-    await f.download_to_memory(buf)
-    mime = getattr(v, "mime_type", None) or "audio/ogg"
-
-    prof, well, acts, evts = await asyncio.to_thread(get_all_data)
-    prompt = [make_prompt(prof, well, acts, evts, "Message vocal"), types.Part.from_bytes(data=buf.getvalue(), mime_type=mime)]
-    ans = await asyncio.to_thread(generate_ai, prompt, user_msg_raw="Message vocal")
-    await send_reply(update.effective_chat.id, ans, context.bot)
-
-def bg_loop():
-    time.sleep(20)
-    url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-
-    try:
-        _, well_init, acts_init, _ = get_all_data()
-        conn = sqlite3.connect(DB)
-        c = conn.cursor()
-        for a in acts_init:
-            c.execute("INSERT OR IGNORE INTO seen_acts VALUES (?)", (str(a["id"]),))
-        if well_init and well_init[0].get("d"):
-            c.execute("INSERT OR IGNORE INTO seen_well VALUES (?)", (str(well_init[0]["d"]),))
-        conn.commit()
-        conn.close()
-    except Exception as e:
-        logging.error(f"Erreur init bg_loop: {e}")
-
-    while True:
-        time.sleep(900)
-        try:
-            prof, well, acts, evts = get_all_data()
-            conn = sqlite3.connect(DB)
-            c = conn.cursor()
-
-            if acts:
-                for a in acts:
-                    act_id = str(a["id"])
-                    c.execute("SELECT 1 FROM seen_acts WHERE id=?", (act_id,))
-                    if not c.fetchone():
-                        c.execute("INSERT OR IGNORE INTO seen_acts VALUES (?)", (act_id,))
-                        conn.commit()
-                        ans = generate_ai(make_prompt(prof, well, acts, evts, f"Débrief séance : {a}"))
-                        requests.post(url, json={"chat_id": TG_USER, "text": f"🏁 <b>Nouvelle séance détectée !</b>\n\n{ans}", "parse_mode": "HTML"}, timeout=10)
-
-            if well and well[0].get("d") and well[0].get("sleep_h"):
-                last_d = well[0]["d"]
-                c.execute("SELECT 1 FROM seen_well WHERE d=?", (last_d,))
-                if not c.fetchone():
-                    c.execute("INSERT OR IGNORE INTO seen_well VALUES (?)", (last_d,))
-                    conn.commit()
-                    ans = generate_ai(make_prompt(prof, well, acts, evts, f"Brief réveil : {well[0]}"))
-                    requests.post(url, json={"chat_id": TG_USER, "text": f"☀️ <b>Réveil détecté</b>\n\n{ans}", "parse_mode": "HTML"}, timeout=10)
-
-            conn.close()
-        except Exception as e:
-            logging.error(f"Erreur boucle bg_loop: {e}")
-
-if __name__ == "__main__":
-    init_db()
-    logging.info("Bot Coach Running démarré avec succès !")
-    threading.Thread(target=bg_loop, daemon=True).start()
-    app = ApplicationBuilder().token(TG_TOKEN).build()
-    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_text))
-    app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))
-    app.run_polling()
     
+    save_chat_msg("coach", text
