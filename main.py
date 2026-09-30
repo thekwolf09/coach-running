@@ -2,6 +2,7 @@ import os
 import io
 import json
 import time
+import asyncio
 import sqlite3
 import datetime
 import requests
@@ -167,7 +168,6 @@ def get_wellness_complet(jours=14):
     return []
 
 def modifier_ou_creer_seance(date_str: str, titre: str, description_workout: str, event_id: int = None) -> str:
-    """Modifie ou crée une séance planifiée dans le calendrier Intervals.icu / Garmin."""
     headers = {"Content-Type": "application/json"}
     payload = {
         "category": "WORKOUT",
@@ -237,6 +237,122 @@ PHYSIOLOGIE & SANTÉ (14 derniers jours : Sommeil, VFC rMSSD vs Baseline, FC rep
 {json.dumps(sante, ensure_ascii=False, indent=2)}
 
 SÉANCES RÉCENTES D'ENTRAÎNEMENT (Allures, FC, Découplage, Cadence) :
+{json.dumps(activites, ensure_ascii=False, indent=2)}
+
+RÈGLES STRICTES DE MISE EN FORME :
+- Format HTML Telegram UNIQUEMENT (<b>gras</b> pour titres/chiffres, <i>italique</i> si besoin).
+- Aéré, percutant, pas de pavé indigeste. Laisse des lignes vides entre chaque point.
+- Émojis sobres (📊, 🫀, 🎯).
+- Si une information durable est donnée (douleur, ressenti clé, imprévu), finis par :
+[MEMOIRE] note à conserver
+"""
+
+async def envoyer_reponse(chat_id, texte, bot):
+    if "[MEMOIRE]" in texte:
+        parts = texte.split("[MEMOIRE]")
+        reponse_user = parts[0].strip()
+        note = parts[1].strip().split("\n")[0]
+        save_memory_note(note)
+    else:
+        reponse_user = texte
+
+    try:
+        await bot.send_message(chat_id=chat_id, text=reponse_user, parse_mode=ParseMode.HTML)
+    except Exception:
+        await bot.send_message(chat_id=chat_id, text=reponse_user)
+
+# --- HANDLERS TELEGRAM ---
+async def handle_message_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != TELEGRAM_USER_ID:
+        return
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
+    
+    contexte = construire_contexte_global()
+    prompt = f"{contexte}\n\nMESSAGE DE L'ATHLÈTE :\n\"{update.message.text}\""
+    texte = generer_analyse(prompt, tools=[modifier_ou_creer_seance])
+    await envoyer_reponse(update.effective_chat.id, texte, context.bot)
+
+async def handle_message_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != TELEGRAM_USER_ID:
+        return
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.RECORD_VOICE)
+
+    voice = update.message.voice or update.message.audio
+    file = await context.bot.get_file(voice.file_id)
+    audio_buffer = io.BytesIO()
+    await file.download_to_memory(audio_buffer)
+    audio_bytes = audio_buffer.getvalue()
+
+    contexte = construire_contexte_global()
+    prompt_parts = [
+        contexte,
+        types.Part.from_bytes(data=audio_bytes, mime_type="audio/ogg"),
+        "Voici le message vocal de l'athlète. Analyse ses propos et réponds-lui avec précision."
+    ]
+
+    texte = generer_analyse(prompt_parts, tools=[modifier_ou_creer_seance])
+    await envoyer_reponse(update.effective_chat.id, texte, context.bot)
+
+# --- BOUCLE DE FOND ASYNCHRONE (PROACTIVITÉ SANS JOBQUEUE) ---
+async def background_surveillance(bot):
+    await asyncio.sleep(30)  # Pause initiale après démarrage
+    while True:
+        try:
+            # 1. Vérification nouvelle séance
+            acts = get_activites_enrichies(limit=2)
+            if acts:
+                derniere = acts[0]
+                act_id = str(derniere.get("id"))
+                with sqlite3.connect(DB_FILE) as conn:
+                    cursor = conn.cursor()
+                    cursor.execute("SELECT COUNT(*) FROM processed_activities")
+                    count = cursor.fetchone()[0]
+                    if count == 0:
+                        mark_activity_processed(act_id)
+                    elif not is_activity_processed(act_id):
+                        mark_activity_processed(act_id)
+                        contexte = construire_contexte_global()
+                        prompt = f"""{contexte}\n\nÉVÉNEMENT PROACTIF : Nouvelle séance détectée !\n{json.dumps(derniere, ensure_ascii=False, indent=2)}\nFais un débrief concis et précis."""
+                        texte = generer_analyse(prompt)
+                        await bot.send_message(chat_id=TELEGRAM_USER_ID, text=f"🏁 <b>Nouvelle séance détectée !</b>\n\n{texte}", parse_mode=ParseMode.HTML)
+
+            # 2. Vérification nouvelle nuit Garmin
+            sante = get_wellness_complet(jours=2)
+            if sante:
+                derniere_sante = sante[0]
+                date_nuit = derniere_sante.get("date")
+                sommeil = derniere_sante.get("sommeil_h")
+                with sqlite3.connect(DB_FILE) as conn:
+                    cursor = conn.cursor()
+                    cursor.execute("SELECT COUNT(*) FROM processed_wellness")
+                    count = cursor.fetchone()[0]
+                    if count == 0:
+                        if date_nuit:
+                            mark_wellness_processed(date_nuit)
+                    elif sommeil and sommeil > 0 and not is_wellness_processed(date_nuit):
+                        mark_wellness_processed(date_nuit)
+                        contexte = construire_contexte_global()
+                        prompt = f"""{contexte}\n\nÉVÉNEMENT PROACTIF : Réveil ({date_nuit}). Données physiologiques reçues :\n{json.dumps(derniere_sante, ensure_ascii=False, indent=2)}\nFais un brief matinal direct et concis."""
+                        texte = generer_analyse(prompt)
+                        await bot.send_message(chat_id=TELEGRAM_USER_ID, text=f"☀️ <b>Réveil détecté · Métriques physiologiques</b>\n\n{texte}", parse_mode=ParseMode.HTML)
+
+        except Exception as e:
+            print(f"Erreur boucle surveillance: {e}")
+
+        await asyncio.sleep(900)  # Vérification toutes les 15 minutes
+
+async def post_init(application):
+    asyncio.create_task(background_surveillance(application.bot))
+
+# --- LANCEMENT DE L'APPLICATION ---
+if __name__ == "__main__":
+    init_db()
+    print("Démarrage du bot autonome...")
+    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).post_init(post_init).build()
+    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message_text))
+    app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_message_voice))
+    app.run_polling()
+ENTRAÎNEMENT (Allures, FC, Découplage, Cadence) :
 {json.dumps(activites, ensure_ascii=False, indent=2)}
 
 RÈGLES STRICTES DE MISE EN FORME :
