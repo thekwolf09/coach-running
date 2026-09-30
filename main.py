@@ -25,18 +25,23 @@ def charger_memoire():
         with open(MEMORY_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
     except:
-        return {"profil": "Coureur 10 km sous 40 min", "notes_historique": []}
+        return {"profil": "Coureur 10 km sous les 40 min", "notes_historique": []}
 
 def sauvegarder_memoire(data):
     with open(MEMORY_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
-def get_dernieres_activites(limit=3):
+def get_dernieres_activites(limit=5):
     url = f"https://intervals.icu/api/v1/athlete/{INTERVALS_ATHLETE_ID}/activities"
-    headers = {"Authorization": f"Bearer {INTERVALS_API_KEY}"}
-    oldest = (datetime.date.today() - datetime.timedelta(days=14)).isoformat()
+    # Authentification officielle Intervals.icu (HTTP Basic avec "API_KEY" en login)
+    auth = requests.auth.HTTPBasicAuth("API_KEY", INTERVALS_API_KEY)
+    
+    # On élargit la recherche aux 60 derniers jours
+    oldest = (datetime.date.today() - datetime.timedelta(days=60)).isoformat()
+    params = {"oldest": oldest}
+    
     try:
-        r = requests.get(url, headers=headers, params={"oldest": oldest})
+        r = requests.get(url, auth=auth, params=params)
         if r.status_code == 200:
             activites = r.json()
             activites_recentes = sorted(activites, key=lambda x: x.get('start_date_local', ''), reverse=True)
@@ -53,6 +58,8 @@ def get_dernieres_activites(limit=3):
                     "decouplage_cardiaque": act.get("icu_decoupling")
                 })
             return resume
+        else:
+            print(f"Erreur HTTP Intervals: {r.status_code} - {r.text}")
     except Exception as e:
         print(f"Erreur API Intervals: {e}")
     return []
