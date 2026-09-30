@@ -1,4 +1,4 @@
-import os, io, json, time, sqlite3, datetime, threading, requests
+kimport os, io, json, time, sqlite3, datetime, threading, requests
 from concurrent.futures import ThreadPoolExecutor
 from requests.auth import HTTPBasicAuth
 from google import genai
@@ -256,7 +256,7 @@ if __name__ == "__main__":
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_text))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))
     app.run_polling()
-een_well VALUES (?)", (last_d,))
+INSERT OR IGNORE INTO seen_well
                     c.commit()
                     ans = generate_ai(make_prompt(prof, well, acts, evts, f"Nuit de sommeil: {well[0]}"))
                     requests.post(url, json={"chat_id": TG_USER, "text": f"<b>Reveil detecte</b>\n\n{ans}", "parse_mode": "HTML"}, timeout=10)
