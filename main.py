@@ -160,21 +160,64 @@ def planifier_seance(date_str: str = "", titre: str = "", description: str = "",
     except Exception as err:
         return f"Erreur de connexion Intervals : {err}"
 
+def supprimer_seance(date_str: str = "", titre: str = "", **kwargs) -> str:
+    """Supprime une séance planifiée sur Intervals.icu.
+    Args:
+        date_str: Date de la séance (ex: '2026-09-30' ou 'today').
+        titre: Titre ou mot clé de la séance à supprimer (optionnel).
+    """
+    d_val = date_str or kwargs.get("date") or kwargs.get("target_date") or datetime.date.today().isoformat()
+    today_iso = datetime.date.today().isoformat()
+    target_date = today_iso if any(k in str(d_val).lower() for k in ["today", "aujourd", "ce jour", "soir"]) else str(d_val).split("T")[0]
+
+    try:
+        r = requests.get(f"{BASE}/events", auth=AUTH, params={"oldest": target_date, "newest": target_date}, timeout=8)
+        if r.status_code != 200:
+            return f"Impossible d'accéder au calendrier Intervals.icu ({r.status_code})."
+        
+        events = [e for e in r.json() if e.get("category") == "WORKOUT"]
+        if not events:
+            return f"Aucune séance planifiée trouvée sur Intervals.icu le {target_date}."
+
+        target_event = None
+        t_search = (titre or kwargs.get("name") or kwargs.get("title") or "").strip().lower()
+        if t_search:
+            for ev in events:
+                if t_search in ev.get("name", "").lower():
+                    target_event = ev
+                    break
+        if not target_event:
+            target_event = events[0]
+
+        ev_id = target_event.get("id")
+        ev_nom = target_event.get("name", "Séance")
+        del_r = requests.delete(f"{BASE}/events/{ev_id}", auth=AUTH, timeout=8)
+        if del_r.status_code in (200, 204):
+            return f"La séance '{ev_nom}' du {target_date} a bien été supprimée de ton calendrier."
+        return f"Erreur lors de la suppression sur Intervals ({del_r.status_code})."
+    except Exception as err:
+        return f"Erreur de connexion Intervals : {err}"
+
 def generate_ai(prompt_parts, user_msg_raw=""):
+    tools_map = {
+        "planifier_seance": planifier_seance,
+        "supprimer_seance": supprimer_seance
+    }
     dernier_bug = ""
     for _ in range(3):
         try:
-            cfg = types.GenerateContentConfig(tools=[planifier_seance], temperature=0.3)
+            cfg = types.GenerateContentConfig(tools=[planifier_seance, supprimer_seance], temperature=0.3)
             r = ai_client.models.generate_content(model="gemini-3.8-flash", contents=prompt_parts, config=cfg)
             if r.function_calls:
                 call = r.function_calls[0]
+                fn = tools_map.get(call.name)
                 args = dict(call.args) if call.args else {}
-                t_res = planifier_seance(**args)
+                t_res = fn(**args) if fn else "Action inconnue"
                 time.sleep(1)
                 conf_prompt = (
                     f"Action exécutée : {t_res}.\n"
                     f"Demande de l'athlète : '{user_msg_raw}'.\n"
-                    f"Confirme à l'athlète en HTML Telegram avec un court conseil d'allure."
+                    f"Confirme brièvement l'action en HTML Telegram avec une remarque bienveillante adaptée au contexte."
                 )
                 r_conf = ai_client.models.generate_content(model="gemini-3.8-flash", contents=conf_prompt)
                 return r_conf.text
@@ -194,7 +237,8 @@ def make_prompt(prof, well, acts, evts, user_msg):
         "2. FORMAT HTML TELEGRAM : utilise <b>Texte en gras</b> pour les allures et chiffres clés. "
         "Aère avec des lignes vides. Pas de dièses (#) ni d'astérisques (**).\n"
         "3. Si un fait durable est mentionné, écris en fin de message : [MEMOIRE] note à enregistrer\n"
-        "4. Si l'athlète demande d'ajouter ou planifier une séance, utilise obligatoirement l'outil planifier_seance."
+        "4. Si l'athlète demande d'ajouter, déplacer ou supprimer une séance, appelle obligatoirement "
+        "l'outil planifier_seance ou supprimer_seance."
     )
     return (
         f"Tu es l'entraîneur d'athlétisme personnel de ce coureur (objectif prioritaire : 5 km sub-20, cible 3'59/km au 13/12/2026).\n"
