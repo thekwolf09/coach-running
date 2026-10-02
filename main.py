@@ -20,6 +20,7 @@ from google import genai
 from google.genai import types
 from telegram import Update
 from telegram.constants import ChatAction
+from telegram.error import Conflict
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -65,7 +66,8 @@ AUTH = HTTPBasicAuth("API_KEY", INTERVALS_KEY)
 API_ROOT = "https://intervals.icu/api/v1"
 BASE = f"{API_ROOT}/athlete/{ATHLETE_ID}"
 TG_API = f"https://api.telegram.org/bot{TG_TOKEN}"
-DB = "coach_brain.db"
+DB = os.environ.get("DB_PATH", "coach_brain.db").strip()    # sur Railway : DB_PATH=/data/coach_brain.db avec un Volume monté sur /data
+STARTUP_DELAY_S = int(os.environ.get("STARTUP_DELAY_S", "25"))   # laisse l'ancienne instance s'arrêter avant de lancer le polling
 POOL = ThreadPoolExecutor(max_workers=5)
 AI_LOCK = threading.Lock()
 
@@ -102,6 +104,7 @@ def db_exec(sql, params=(), fetch=False):
 
 
 def init_db():
+    os.makedirs(os.path.dirname(os.path.abspath(DB)), exist_ok=True)
     db_exec("CREATE TABLE IF NOT EXISTS notes (id INTEGER PRIMARY KEY AUTOINCREMENT, d TEXT, txt TEXT)")
     db_exec("CREATE TABLE IF NOT EXISTS seen_acts (id TEXT PRIMARY KEY)")
     db_exec("CREATE TABLE IF NOT EXISTS seen_well (d TEXT PRIMARY KEY)")
@@ -1613,8 +1616,28 @@ async def handle_cost(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(usage_report())
 
 
+_CONFLICT = {"first": 0.0, "last": 0.0, "n": 0, "alerted": 0.0}
+
+
 async def on_error(update, context: ContextTypes.DEFAULT_TYPE):
-    logging.error("Exception Telegram", exc_info=context.error)
+    err = context.error
+    if isinstance(err, Conflict):
+        # Deux instances interrogent Telegram avec le même token : normal quelques secondes pendant un déploiement
+        now = time.time()
+        if now - _CONFLICT["last"] > 120:      # nouvelle série de conflits
+            _CONFLICT.update(first=now, n=0)
+        _CONFLICT["last"] = now
+        _CONFLICT["n"] += 1
+        logging.warning("Telegram Conflict n°%d : une autre instance utilise ce token (transitoire pendant un déploiement)", _CONFLICT["n"])
+        if now - _CONFLICT["first"] >= 300 and now - _CONFLICT["alerted"] > 21600:
+            _CONFLICT["alerted"] = now
+            await asyncio.to_thread(
+                tg_send, TG_USER,
+                "⚠️ <b>Conflit Telegram persistant</b> (plus de 5 min) : une autre instance du bot tourne avec le même token "
+                "(autre service Railway, ordinateur, ancien projet). Arrête-la, ou régénère le token dans BotFather "
+                "et mets à jour TELEGRAM_BOT_TOKEN.")
+        return
+    logging.error("Exception Telegram", exc_info=err)
 
 
 # --------------------------------------------------------------------------
@@ -1741,6 +1764,9 @@ if __name__ == "__main__":
     check_config()
     init_db()
     apply_timezone()
+    if STARTUP_DELAY_S > 0:
+        logging.info(f"Attente de {STARTUP_DELAY_S} s : l'ancienne instance doit s'arrêter avant le polling Telegram")
+        time.sleep(STARTUP_DELAY_S)
     logging.info(f"Bot Coach Running démarré (modèle : {MODEL_NAME})")
     threading.Thread(target=bg_loop, daemon=True).start()
     app = ApplicationBuilder().token(TG_TOKEN).build()
