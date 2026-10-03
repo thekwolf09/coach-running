@@ -55,6 +55,9 @@ WELLNESS_FULL_DAYS = int(os.environ.get("WELLNESS_FULL_DAYS", "90"))   # jours d
 PRICE_IN = float(os.environ.get("PRICE_IN", "0.75"))          # $ par million de tokens (tarif Gemini 3.8 Flash jusqu'au 31/12/2026)
 PRICE_CACHED = float(os.environ.get("PRICE_CACHED", "0.075"))
 PRICE_OUT = float(os.environ.get("PRICE_OUT", "3.75"))        # la réflexion est facturée comme de la sortie
+REMINDER_LEAD_MIN = int(os.environ.get("REMINDER_LEAD_MIN", "60"))   # rappel météo N minutes avant une séance
+FOLLOWUP_HOUR = int(os.environ.get("FOLLOWUP_HOUR", "21"))          # relance si la séance du jour n'est pas détectée
+TRAIN_HOUR = int(os.environ.get("TRAIN_HOUR", "18"))                # heure par défaut si tes courses n'ont pas d'horaire habituel
 THINKING_ROUTINE = os.environ.get("THINKING_ROUTINE", "low").strip().lower()    # gestion du calendrier (planifier, décaler...)
 THINKING_CHAT = os.environ.get("THINKING_CHAT", "medium").strip().lower()       # conversation, brief réveil, bilan
 THINKING_DEEP = os.environ.get("THINKING_DEEP", "high").strip().lower()         # analyse d'une séance avec son CSV
@@ -206,12 +209,62 @@ def fetch_profile():
 
 
 _WEATHER_CACHE = {}
+WEATHER_TTL = 900
+
+
+def _comfort_penalty(r):
+    """Plus c'est bas, mieux c'est pour courir : confort thermique, pluie, vent."""
+    ress = r.get("ress_c")
+    if ress is None:
+        return None
+    return (max(0.0, ress - 16) * 1.0 + max(0.0, 6 - ress) * 0.8 + (r.get("pluie_pct") or 0) * 0.05
+            + (r.get("pluie_mm") or 0) * 5 + max(0.0, (r.get("vent_kmh") or 0) - 20) * 0.3)
+
+
+def best_windows(rows, n=3):
+    cand = []
+    for r in rows:
+        try:
+            hh = int(r["t"][11:13])
+        except Exception:
+            continue
+        pen = _comfort_penalty(r) if 5 <= hh <= 21 else None
+        if pen is not None:
+            cand.append((pen, r))
+    cand.sort(key=lambda x: x[0])
+    return [f"{r['h']} (ressenti {r['ress_c']}°C, pluie {r['pluie_pct']} %, vent {r['vent_kmh']} km/h)" for _, r in cand[:n]]
+
+
+def weather_window(weather, start, hours=2):
+    """Lignes horaires couvrant une séance qui démarre à `start` (datetime local)."""
+    rows = (weather or {}).get("horaire") or []
+    key = start.strftime("%Y-%m-%dT%H:00")
+    for i, r in enumerate(rows):
+        if r.get("t") == key:
+            return rows[i:i + hours]
+    return []
+
+
+def weather_tips(rows):
+    tips = []
+    if not rows:
+        return tips
+    ress = [r["ress_c"] for r in rows if r.get("ress_c") is not None]
+    if max((r.get("pluie_pct") or 0) for r in rows) >= 50:
+        tips.append("pluie probable : veste imperméable, ou décale d'un créneau")
+    if ress and min(ress) <= 6:
+        tips.append("froid : manches longues, gants fins, échauffement plus long")
+    if ress and max(ress) >= 24:
+        tips.append("chaleur : hydrate-toi et ralentis de 5 à 10 s/km")
+    if max((r.get("vent_kmh") or 0) for r in rows) >= 30:
+        tips.append("vent fort : pars face au vent pour rentrer vent dans le dos")
+    return tips
 
 
 def fetch_weather(city_name: str = ""):
     city = (city_name or "").strip() or DEFAULT_CITY
     cached = _WEATHER_CACHE.get(city)
-    if cached and time.time() - cached[0] < 1800:
+    if cached and time.time() - cached[0] < WEATHER_TTL:
         return cached[1]
     try:
         geo = requests.get(
@@ -229,10 +282,11 @@ def fetch_weather(city_name: str = ""):
                     "longitude": g["longitude"],
                     "current": "temperature_2m,apparent_temperature,precipitation,wind_speed_10m",
                     "daily": "temperature_2m_max,temperature_2m_min,precipitation_probability_max",
+                    "hourly": "temperature_2m,apparent_temperature,precipitation_probability,precipitation,wind_speed_10m",
                     "forecast_days": 3,
                     "timezone": "auto",
                 },
-                timeout=6,
+                timeout=8,
             )
             if w.status_code == 200:
                 data = w.json()
@@ -251,15 +305,38 @@ def fetch_weather(city_name: str = ""):
                     }
                     for i in range(len(dates))
                 ]
+
+                hourly = data.get("hourly", {})
+                times = hourly.get("time", [])
+                cur_time = str(cur.get("time") or "")
+                cur_date = cur_time[:10] or (times[0][:10] if times else "")
+                start_i = next((i for i, t in enumerate(times) if t >= cur_time[:13] + ":00"), 0)
+
+                def hv(key, i, nd=0):
+                    arr = hourly.get(key, [])
+                    v = arr[i] if i < len(arr) else None
+                    return None if v is None else (round(v, nd) if nd else int(round(v)))
+
+                rows = []
+                for i in range(start_i, min(start_i + 24, len(times))):
+                    day = times[i][:10]
+                    tomorrow = (datetime.date.fromisoformat(cur_date) + datetime.timedelta(days=1)).isoformat() if cur_date else ""
+                    label = "auj" if day == cur_date else ("dem" if day == tomorrow else day[5:])
+                    rows.append({"t": times[i], "h": f"{label} {times[i][11:13]}h", "temp_c": hv("temperature_2m", i),
+                                 "ress_c": hv("apparent_temperature", i), "pluie_pct": hv("precipitation_probability", i),
+                                 "pluie_mm": hv("precipitation", i, 1), "vent_kmh": hv("wind_speed_10m", i)})
                 out = {
                     "ville": g.get("name", city),
                     "maintenant": {
+                        "heure_locale": cur_time[11:16] or None,
                         "temp_c": cur.get("temperature_2m"),
                         "ressenti_c": cur.get("apparent_temperature"),
                         "vent_kmh": cur.get("wind_speed_10m"),
                         "pluie_mm": cur.get("precipitation"),
                     },
                     "previsions_3j": forecast,
+                    "creneaux_favorables_24h": best_windows(rows),
+                    "horaire": rows,
                 }
                 _WEATHER_CACHE[city] = (time.time(), out)
                 return out
@@ -561,7 +638,7 @@ def _dash_zones(c):
 def _dash_adherence(c):
     today = c["today"]
     run_days = {a["d"] for a in c["recent"] if a.get("type") in RUN_TYPES}
-    planned = [e for e in c["evts"] if e.get("category") in (None, "WORKOUT")
+    planned = [e for e in c["evts"] if e.get("category") in (None, "WORKOUT") and e.get("type") in (None, *RUN_TYPES)
                and (_age_days(e.get("d"), today) or 0) >= 1 and (_age_days(e.get("d"), today) or 0) <= 28]
     if not planned:
         return None
@@ -576,18 +653,107 @@ def _dash_adherence(c):
     return t + (" ; manquées : " + "; ".join(missed[:5]) if missed else "")
 
 
-def _dash_efforts(c):
-    best = None
-    for d in c["details"]:
+def _effort_points(details):
+    """Meilleur lap WORK de 4 min et plus de chaque course."""
+    out = []
+    for d in details or []:
+        best = None
         for lap in d.get("laps") or []:
             sec = _pace_sec(lap.get("pace"))
-            if lap.get("type") == "WORK" and (lap.get("duree_s") or 0) >= 180 and sec and (best is None or sec < best[0]):
-                best = (sec, lap, d)
-    if not best:
+            if lap.get("type") == "WORK" and (lap.get("duree_s") or 0) >= 240 and sec and (best is None or sec < best[0]):
+                best = (sec, lap)
+        if best:
+            out.append({"id": d.get("id"), "d": d.get("d"), "nom": d.get("nom"), "pace_s": best[0],
+                        "hr": best[1].get("hr"), "duree_s": best[1].get("duree_s")})
+    return out
+
+
+def effort_history(details=None):
+    """Historique des meilleurs efforts : tout ce qui est en cache en base (s'allonge au fil des séances) + les courses détaillées en cours."""
+    points = {}
+    try:
+        for (payload,) in db_exec("SELECT payload FROM act_details WHERE v=?", (DETAIL_VERSION,), fetch=True) or []:
+            for pt in _effort_points([json.loads(payload)]):
+                points[pt["id"] or pt["d"]] = pt
+    except Exception:
+        logging.exception("effort_history")
+    for pt in _effort_points(details):
+        points[pt["id"] or pt["d"]] = pt
+    return sorted(points.values(), key=lambda x: str(x["d"]))
+
+
+def _dash_decouplage(c):
+    rows = sorted((d for d in c["details"] if d.get("decouplage_pct") is not None), key=lambda d: str(d.get("d")), reverse=True)[:6]
+    if not rows:
         return None
-    _, lap, d = best
-    return (f"MEILLEUR EFFORT RÉCENT (lap WORK de 3 min et plus, courses détaillées) : {_mmss(best[0])}/km à {lap.get('hr', '?')} bpm "
-            f"sur {lap.get('duree_s')} s ({d.get('d')} {_cell(d.get('nom'))}) ; objectif : {GOAL_TEXT}")
+    return ("DÉCOUPLAGE FC/allure (dérive cardiaque : sous 5 % = bon, au-delà de 8 % = fatigue ou intensité trop haute) : "
+            + " | ".join(f"{d['d']} {_cell(d['decouplage_pct'])} % ({_cell(d.get('nom'))})" for d in rows))
+
+
+def _dash_objectif(c):
+    today = c["today"]
+    days_left = (GOAL_DATE - today).days
+    if days_left < 0:
+        return None
+    mt = re.search(r"(\d+)'(\d{2})", GOAL_TEXT)
+    goal_pace = int(mt.group(1)) * 60 + int(mt.group(2)) if mt else None
+    parts = [f"{GOAL_TEXT} le {GOAL_DATE.strftime('%d/%m/%Y')} : J-{days_left}, soit {days_left / 7:.1f} semaines"]
+    hist = effort_history(c["details"])
+    est = None
+    recent_pts = [h for h in hist if (_age_days(h["d"]) if _age_days(h["d"]) is not None else 999) <= 56]
+    if recent_pts:
+        best = min(recent_pts, key=lambda h: h["pace_s"])
+        est = best["pace_s"] * 0.95
+        parts.append(f"meilleur effort structuré de 4 min et plus (8 dernières semaines) : {_mmss(best['pace_s'])}/km sur {best['duree_s']} s "
+                     f"à {best.get('hr') or '?'} bpm le {best['d']} ; équivalent 5 km estimé : {_mmss(est)}/km, soit {_mmss(est * 5)} "
+                     f"(hypothèse : allure 5 km = allure de ces efforts − 5 %, ordre de grandeur prudent)")
+        tr = hist[-4:]
+        if len(tr) >= 2 and tr[0]["d"] != tr[-1]["d"]:
+            parts.append(f"tendance des meilleurs efforts : {tr[0]['d']} {_mmss(tr[0]['pace_s'])} → {tr[-1]['d']} {_mmss(tr[-1]['pace_s'])} "
+                         f"({tr[-1]['pace_s'] - tr[0]['pace_s']:+d} s/km)")
+    else:
+        parts.append("estimation du 5 km impossible : aucun effort structuré de 4 min et plus enregistré récemment")
+    tops = [t for t in (c["acts"].get("top_performances_recentes") or []) if 4.5 <= (t.get("distance_km") or 0) <= 6.5 and _pace_sec(t.get("allure"))]
+    if tops:
+        t = min(tops, key=lambda x: _pace_sec(x["allure"]))
+        parts.append(f"meilleure sortie de 4,5 à 6,5 km (6 mois) : {_mmss(_pace_sec(t['allure']))}/km sur {t['distance_km']} km le {t['date']}")
+    if est and goal_pace:
+        gap = est - goal_pace
+        if gap > 0:
+            parts.append(f"écart à l'objectif : {gap:.0f} s/km ({gap / est * 100:.0f} %), soit {_mmss(gap * 5)} sur 5 km ; "
+                         f"progression nécessaire ≈ {gap / max(days_left / 7, 0.1):.1f} s/km par semaine")
+        else:
+            parts.append(f"objectif déjà couvert par l'estimation ({-gap:.0f} s/km de marge)")
+    return "OBJECTIF : " + " | ".join(parts)
+
+
+def _dash_enveloppe(c):
+    today, recent, risk = c["today"], c["recent"], c["risk"]
+    loads = _daily_loads(c["acts"], 28)
+    if sum(loads) <= 0:
+        return None
+    coef = 0.7 if risk.get("statut") == "DANGER" else 1.0
+    chronic, acute = sum(loads) / 4, sum(loads[:7])
+    max_load = round(chronic * ROLLING_ACWR_LIMIT * coef)
+    parts = [f"charge sur 7 jours glissants : max ≈ {max_load} (1,3 × moyenne hebdo 28 j de {chronic:.0f}"
+             f"{', réduit de 30 % car alerte' if coef < 1 else ''}), cumulée {acute:.0f}, marge {max_load - round(acute):+d}"]
+    this = _monday(today)
+    km = {}
+    for a in recent:
+        if a.get("type") in RUN_TYPES:
+            ws = _monday(datetime.date.fromisoformat(a["d"]))
+            km[ws] = km.get(ws, 0.0) + (a.get("km") or 0)
+    last, done = km.get(this - datetime.timedelta(days=7), 0.0), km.get(this, 0.0)
+    if last > 0:
+        max_km = last * 1.10 * coef
+        parts.append(f"km de la semaine en cours : max ≈ {max_km:.0f} (+10 % sur les {last:.0f} km de la semaine dernière), "
+                     f"faits {done:.1f}, reste {max(0.0, max_km - done):.1f}")
+        parts.append(f"sortie longue max ≈ {max_km / 3:.1f} km (un tiers du volume)")
+    ramp = risk.get("rampe_ctl_7j")
+    if ramp is not None:
+        parts.append(f"rampe CTL sur 7 jours {ramp:+.1f} (limite +{RAMP_LIMIT:g}), marge {RAMP_LIMIT - ramp:+.1f}")
+    parts.append("jamais deux séances intenses à moins de 48 h")
+    return "ENVELOPPE DE CHARGE POUR PLANIFIER (garde-fous du code) : " + " | ".join(parts)
 
 
 def dashboard_lines(prof, well, acts, evts, risk=None):
@@ -595,7 +761,8 @@ def dashboard_lines(prof, well, acts, evts, risk=None):
            "recent": (acts or {}).get("brut_recent", []), "details": (acts or {}).get("detail_dernieres_courses") or [],
            "risk": risk or evaluate_injury_risk(well, acts)}
     out = []
-    for fn in (_dash_recup, _dash_charge, _dash_semaines, _dash_rythme, _dash_allure_facile, _dash_zones, _dash_adherence, _dash_efforts):
+    for fn in (_dash_recup, _dash_charge, _dash_semaines, _dash_rythme, _dash_allure_facile, _dash_decouplage, _dash_zones,
+               _dash_adherence, _dash_objectif, _dash_enveloppe):
         try:
             line = fn(ctx)
             if line:
@@ -637,6 +804,7 @@ def fetch_activities():
                 "pace": _pace(spd),
                 "hr": _num(a.get("average_heartrate"), 0),
                 "load": _num(a.get("icu_training_load"), 0),
+                "h": str(a.get("start_date_local") or "")[11:16],
             }
             if a.get("type") in RUN_TYPES and dist >= 3000 and spd > 0:
                 runs.append((spd, item))
@@ -699,7 +867,7 @@ def fetch_events():
                     gap = abs((datetime.date.fromisoformat(d_str) - today).days)
                 except ValueError:
                     gap = 999
-                row = {"d": d_str, "nom": e.get("name")}
+                row = {"d": d_str, "nom": e.get("name"), "type": e.get("type")}
                 hh = str(e.get("start_date_local") or "")[11:16]
                 if hh and hh != "00:00":
                     row["h"] = hh
@@ -1473,13 +1641,24 @@ SYSTEM_INSTRUCTION = (
     "« analyse détaillée de [la séance ou la date] » (ajouter « csv complet » pour avoir la seconde par seconde).\n"
     "10. Structure selon le message. BRIEF RÉVEIL : (a) récupération chiffrée par rapport à ses références ; (b) charge et tendance ; "
     "(c) séance du jour : la garder ou l'adapter, avec une prescription précise (durée, allure ou plage de FC justifiée par ses "
-    "données, météo si elle compte) ; (d) un seul point de vigilance. DÉBRIEF DE SÉANCE : (a) exécution par rapport aux consignes du "
-    "calendrier, lap par lap ; (b) coût physiologique (FC, dérive, découplage, régularité) ; (c) ce que cela dit de la progression "
-    "vers l'objectif ; (d) impact sur les 2 à 3 prochains jours. QUESTION LIBRE : réponds d'abord à la question, puis seulement le "
-    "contexte qui change ta réponse.\n"
-    "11. Raisonne sur le fond : si des données manquent ou se contredisent, dis-le et donne l'hypothèse la plus probable plutôt "
+    "données, météo du créneau si elle compte) ; (d) un seul point de vigilance ; (e) objectif : une seule ligne, uniquement le "
+    "lundi ou si un indicateur a nettement bougé. DÉBRIEF DE SÉANCE : (a) exécution par rapport aux consignes du calendrier, lap "
+    "par lap ; (b) coût physiologique (FC, dérive, découplage, régularité) ; (c) ce que cela dit de la progression vers l'objectif ; "
+    "(d) impact sur les 2 à 3 prochains jours. BILAN HEBDOMADAIRE : (a) volume réalisé par rapport à l'enveloppe, charge, fatigue, "
+    "adhérence au plan ; (b) section OBJECTIF détaillée à partir de la ligne OBJECTIF du tableau de bord : estimation actuelle du "
+    "5 km, écart, progression nécessaire par semaine, tendance, verdict honnête sur la faisabilité (ni complaisant ni alarmiste) et "
+    "ajustement du plan si besoin ; (c) les 3 séances clés de la semaine à venir, dans l'enveloppe de charge. QUESTION LIBRE : "
+    "réponds d'abord à la question, puis seulement le contexte qui change ta réponse.\n"
+    "11. Planification : avant de planifier ou de valider une séance ou un volume, vérifie l'ENVELOPPE DE CHARGE. Si la demande la "
+    "dépasse, dis-le avec les chiffres et propose une alternative qui rentre dans l'enveloppe. Si l'athlète insiste, planifie "
+    "quand même en précisant le risque : c'est lui qui décide.\n"
+    "12. Météo : l'heure locale est fournie. Pour « dans 1 h », « ce soir », « demain matin », utilise le tableau MÉTÉO HEURE PAR "
+    "HEURE et les créneaux favorables ; réponds avec les chiffres de l'heure demandée (ressenti, pluie, vent) et un conseil "
+    "concret (tenue, créneau).\n"
+    "13. Raisonne sur le fond : si des données manquent ou se contredisent, dis-le et donne l'hypothèse la plus probable plutôt "
     "que d'affirmer. Sois dense : chaque phrase apporte un chiffre ou une décision, sans préambule ni remplissage. Longueur selon "
-    "le besoin : 150 à 250 mots pour un brief ou une réponse d'analyse, jusqu'à 400 mots pour un débrief de séance."
+    "le besoin : 150 à 250 mots pour un brief ou une réponse d'analyse, jusqu'à 400 mots pour un débrief de séance, 500 pour le "
+    "bilan hebdomadaire."
 )
 
 
@@ -1666,6 +1845,7 @@ EVT_COLS = [("d", "d"), ("h", "h"), ("cat", "category"), ("nom", "nom"), ("descr
 LAP_COLS = [("n", "n"), ("type", "type"), ("label", "label"), ("debut_s", "debut_s"), ("duree_s", "duree_s"), ("km", "km"),
             ("allure", "pace"), ("fc", "hr"), ("fc_max", "hr_max"), ("cad", "cad"), ("d+", "d+"), ("par_min", "par_min")]
 KM_COLS = [("km", "km"), ("allure", "pace"), ("fc", "hr"), ("cad", "cad"), ("d_alt", "d_alt")]
+WEATHER_COLS = [("heure", "h"), ("temp", "temp_c"), ("ressenti", "ress_c"), ("pluie_pct", "pluie_pct"), ("pluie_mm", "pluie_mm"), ("vent_kmh", "vent_kmh")]
 
 
 def format_run_details(details):
@@ -1750,10 +1930,11 @@ def make_prompt(prof, weather, well, acts, evts, user_msg, series="auto"):
         + ("\n".join(dashboard_lines(prof, well, acts, evts)) or "(indisponible)"),
         "",
         f"Objectif prioritaire : {GOAL_TEXT} le {GOAL_DATE.strftime('%d/%m/%Y')} ({goal_line}).",
-        f"Aujourd'hui : {JOURS_FR[today.weekday()]} {today.isoformat()}.",
+        f"Aujourd'hui : {JOURS_FR[today.weekday()]} {today.isoformat()}, il est {datetime.datetime.now():%H:%M} (heure locale).",
         f"Repères de dates : {reperes}.",
         _block("SURVEILLANCE SURCHARGE (statut, signaux et consigne)", surveillance_info(well, acts)),
-        _block("MÉTÉO", weather),
+        _block("MÉTÉO (ville, maintenant, 3 jours, créneaux les plus favorables)", {k: v for k, v in (weather or {}).items() if k != "horaire"}),
+        _tblock("MÉTÉO HEURE PAR HEURE, 24 h, heure locale (pluie_pct = probabilité de pluie)", (weather or {}).get("horaire"), WEATHER_COLS),
         "HISTORIQUE RÉCENT DE CONVERSATION (du plus ancien au plus récent) :\n" + hist,
     ]
     if series_block:
@@ -1956,6 +2137,83 @@ def _push(header, ans, tag):
         tg_send(TG_USER, f"{header}\n\n{text}")
 
 
+def usual_train_hour(recent, today=None):
+    """Heure médiane de tes courses des 28 derniers jours (sinon TRAIN_HOUR)."""
+    today = today or datetime.date.today()
+    since = (today - datetime.timedelta(days=28)).isoformat()
+    hs = sorted(int(a["h"][:2]) for a in recent if a.get("type") in RUN_TYPES and a.get("h") and a.get("d", "") >= since)
+    return hs[len(hs) // 2] if len(hs) >= 3 else TRAIN_HOUR
+
+
+def _esc(x):
+    return html.escape(str(x), quote=False)
+
+
+def build_reminder(e, start, weather, mins):
+    lines = [f"⏰ <b>Séance à {start:%H:%M} : {_esc(e.get('nom') or 'Séance')}</b> (dans environ {int(round(mins / 5) * 5)} min)"]
+    desc = (e.get("desc") or "").strip().replace("\n", " | ")
+    if desc:
+        lines.append(_esc(desc[:220]))
+    rows = weather_window(weather, start)
+    if rows:
+        r0 = rows[0]
+        lines.append(f"🌦️ Pendant la séance : {r0['temp_c']}°C (ressenti {r0['ress_c']}°C), pluie {r0['pluie_pct']} %, vent {r0['vent_kmh']} km/h")
+        tips = weather_tips(rows)
+        if tips:
+            now_key = (start - datetime.timedelta(minutes=mins)).strftime("%Y-%m-%dT%H:00")
+            alt = best_windows([r for r in (weather or {}).get("horaire") or [] if r.get("t", "") >= now_key], 1)
+            lines.append("👉 " + " ; ".join(tips) + "." + (f" Meilleur créneau des 24 h : {_esc(alt[0])}." if alt and any("pluie" in t for t in tips) else ""))
+    return "\n\n".join(lines)
+
+
+def build_followup(e):
+    return (f"🕘 <b>Séance non détectée aujourd'hui : {_esc(e.get('nom') or 'Séance')}</b>\n\n"
+            "Si elle est faite, elle n'est peut-être pas encore synchronisée. Sinon écris « décale à demain » ou « annule » "
+            "et je mets le calendrier à jour.")
+
+
+def _push_plain(text, tag):
+    save_chat_msg("coach", f"[{tag}] " + html.unescape(re.sub(r"<[^>]+>", "", text)))
+    tg_send(TG_USER, text)
+
+
+def reminders_tick(evts, acts, weather, now=None):
+    """Rappel météo avant la séance du jour, relance le soir si elle n'est pas détectée. Messages écrits par le code, sans Gemini."""
+    now = now or datetime.datetime.now()
+    today = now.date()
+    iso = today.isoformat()
+    todays = [e for e in (evts or []) if e.get("d") == iso and e.get("category") in (None, "WORKOUT") and e.get("type") in (None, *RUN_TYPES)]
+    if not todays:
+        return
+    recent = (acts or {}).get("brut_recent", [])
+    if any(a.get("d") == iso and a.get("type") in RUN_TYPES for a in recent):
+        return
+    usual = usual_train_hour(recent, today)
+    for e in todays:
+        nom = e.get("nom") or "Séance"
+        try:
+            start = datetime.datetime.combine(today, datetime.time.fromisoformat(e.get("h") or f"{usual:02d}:00"))
+        except ValueError:
+            continue
+        mins = (start - now).total_seconds() / 60
+        if 0 < mins <= REMINDER_LEAD_MIN:
+            key, text, tag = f"rappel|{iso}|{nom}", None, "Rappel auto"
+            if claim("seen_reports", key):
+                try:
+                    _push_plain(build_reminder(e, start, weather, mins), tag)
+                except Exception:
+                    release("seen_reports", key)
+                    logging.exception("rappel")
+        elif now.hour >= FOLLOWUP_HOUR and mins <= -60:
+            key = f"relance|{iso}|{nom}"
+            if claim("seen_reports", key):
+                try:
+                    _push_plain(build_followup(e), "Relance auto")
+                except Exception:
+                    release("seen_reports", key)
+                    logging.exception("relance")
+
+
 def bg_init():
     try:
         _, _, well, acts, _ = get_all_data()
@@ -2016,14 +2274,20 @@ def bg_tick():
         week_id = f"bilan_{iso[0]}_{iso[1]}"
         if not is_seen("seen_reports", week_id) and claim("seen_reports", week_id):
             try:
-                msg = ("C'est dimanche soir. Rédige le BILAN HEBDOMADAIRE complet : volume en km réalisé vs prévu, "
-                       "charge, fatigue, et présente les 3 séances clés de la semaine à venir." + AUTO_SUFFIX)
-                ans = generate_ai(make_prompt(prof, weather, well, acts, evts, msg, series=False), allow_tools=False)
+                msg = ("C'est dimanche soir. Rédige le BILAN HEBDOMADAIRE complet : volume réalisé par rapport à l'enveloppe, "
+                       "charge, fatigue, adhérence au plan ; section OBJECTIF détaillée ; les 3 séances clés de la semaine à venir "
+                       "dans l'enveloppe de charge." + AUTO_SUFFIX)
+                ans = generate_ai(make_prompt(prof, weather, well, acts, evts, msg, series=False), allow_tools=False, level=THINKING_DEEP)
                 _push("📊 <b>Bilan hebdomadaire du Coach</b>", ans, "Bilan Hebdo")
                 ack_alert(well, ans, acts)
             except Exception as e:
                 release("seen_reports", week_id)
                 logging.warning(f"Bilan hebdo différé : {e}")
+
+    try:
+        reminders_tick(evts, acts, weather)
+    except Exception:
+        logging.exception("reminders_tick")
 
 
 def bg_loop():
