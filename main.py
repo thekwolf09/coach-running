@@ -11,6 +11,7 @@ import html
 import sqlite3
 import datetime
 import asyncio
+import contextlib
 import logging
 import threading
 import requests
@@ -40,6 +41,7 @@ DEFAULT_CITY = os.environ.get("DEFAULT_CITY", "Melbourne").strip()
 
 GOAL_DATE = datetime.date(2026, 12, 13)
 GOAL_TEXT = "5 km sub-20, cible 3'59/km"
+ATHLETE_NAME = os.environ.get("ATHLETE_NAME", "").strip()      # prénom utilisé par le coach (optionnel)
 
 BG_INTERVAL = 900               # secondes entre deux verifications automatiques
 MAX_DEBRIEFS_PER_CYCLE = 2      # limite d'appels Gemini automatiques par cycle
@@ -47,8 +49,8 @@ MAX_UNAVAILABILITY_DAYS = 14    # plage maximale supprimable en une demande
 DATA_TTL = 120                  # cache des donnees Intervals (secondes)
 DETAIL_RUNS = int(os.environ.get("DETAIL_RUNS", "6"))   # courses détaillées (laps + durée en zones)
 DETAIL_FULL = 3                 # parmi elles, nb de courses avec splits au kilomètre
-DETAIL_VERSION = 2              # incrémenter pour forcer le recalcul du cache de détails
-STREAM_VERSION = 1
+DETAIL_VERSION = 3              # incrémenter pour forcer le recalcul du cache de détails
+STREAM_VERSION = 2
 RAW_DAYS = int(os.environ.get("RAW_DAYS", "90"))   # activités listées une par une ; au-delà (jusqu'à 6 mois) : agrégats hebdo
 DESC_DAYS = int(os.environ.get("DESC_DAYS", "21"))  # descriptions de séances envoyées à +/- N jours (noms seuls au-delà)
 WELLNESS_FULL_DAYS = int(os.environ.get("WELLNESS_FULL_DAYS", "90"))   # jours de santé envoyés un par un
@@ -119,6 +121,13 @@ def init_db():
     db_exec("CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT)")
     db_exec("CREATE TABLE IF NOT EXISTS act_details (id TEXT PRIMARY KEY, v INTEGER, payload TEXT)")
     db_exec("CREATE TABLE IF NOT EXISTS act_streams (id TEXT PRIMARY KEY, v INTEGER, blob BLOB)")
+    db_exec("CREATE TABLE IF NOT EXISTS efforts (id TEXT PRIMARY KEY, d TEXT, nom TEXT, pace_s INTEGER, hr INTEGER, duree_s INTEGER)")
+    try:   # conserve l'historique des meilleurs efforts avant de purger les anciens détails mis en cache
+        for (payload,) in db_exec("SELECT payload FROM act_details", fetch=True) or []:
+            for pt in _effort_points([json.loads(payload)]):
+                save_effort(pt)
+    except Exception:
+        logging.exception("migration des efforts")
     db_exec("DELETE FROM act_details WHERE v != ?", (DETAIL_VERSION,))
     db_exec("DELETE FROM act_streams WHERE v != ?", (STREAM_VERSION,))
     db_exec("DELETE FROM deleted_events WHERE d < date('now', '-30 day')")
@@ -129,7 +138,7 @@ def save_note(txt: str):
 
 
 def get_notes():
-    rows = db_exec("SELECT d, txt FROM notes ORDER BY id DESC LIMIT 20", fetch=True)
+    rows = db_exec("SELECT d, txt FROM notes ORDER BY id DESC LIMIT 30", fetch=True)
     return [{"date": r[0], "note": r[1]} for r in reversed(rows)]
 
 
@@ -141,7 +150,7 @@ def save_chat_msg(role: str, text: str):
 
 def get_chat_history(limit: int = 6):
     rows = db_exec("SELECT role, txt FROM chat_history ORDER BY id DESC LIMIT ?", (limit,), fetch=True)
-    return [{"role": r[0], "text": r[1][:500]} for r in reversed(rows)]
+    return [{"role": r[0], "text": r[1][:(600 if r[0] == "athlete" else 350)]} for r in reversed(rows)]
 
 
 def is_seen(table: str, key: str) -> bool:
@@ -584,6 +593,30 @@ def _dash_semaines(c):
     return out
 
 
+def _dash_semaine_plan(c):
+    today, recent = c["today"], c["recent"]
+    this = _monday(today)
+    lo, hi = this.isoformat(), (this + datetime.timedelta(days=6)).isoformat()
+    planned = sorted((e for e in c["evts"] if e.get("category") in (None, "WORKOUT") and e.get("type") in (None, *RUN_TYPES)
+                      and lo <= e.get("d", "") <= hi), key=lambda e: e["d"])
+    if not planned:
+        return None
+    runs = [a for a in recent if a.get("type") in RUN_TYPES]
+    out = []
+    for e in planned:
+        d = datetime.date.fromisoformat(e["d"])
+        near = [a for a in runs if abs((datetime.date.fromisoformat(a["d"]) - d).days) <= 1]
+        match = next((a for a in near if a["d"] == e["d"]), near[0] if near else None)
+        label = f"{_cell(e.get('nom'))} ({JOURS_FR[d.weekday()][:3]} {d:%d/%m})"
+        if match:
+            out.append(f"{label} → fait : {match.get('min', 0):.0f} min, {_cell(match.get('pace'))}, FC {_cell(match.get('hr'))}")
+        elif e["d"] < today.isoformat():
+            out.append(f"{label} → non faite")
+        else:
+            out.append(f"{label} → {'aujourd hui' if e['d'] == today.isoformat() else 'à venir'}")
+    return "SEMAINE EN COURS, prévu → réalisé : " + " | ".join(out)
+
+
 def _dash_rythme(c):
     today, recent = c["today"], c["recent"]
     days = set()
@@ -668,17 +701,21 @@ def _effort_points(details):
     return out
 
 
+def save_effort(pt):
+    db_exec("INSERT OR REPLACE INTO efforts (id, d, nom, pace_s, hr, duree_s) VALUES (?, ?, ?, ?, ?, ?)",
+            (str(pt.get("id") or pt.get("d")), pt.get("d"), pt.get("nom"), pt.get("pace_s"), pt.get("hr"), pt.get("duree_s")))
+
+
 def effort_history(details=None):
-    """Historique des meilleurs efforts : tout ce qui est en cache en base (s'allonge au fil des séances) + les courses détaillées en cours."""
+    """Historique des meilleurs efforts : table `efforts` (s'allonge à chaque séance) + les courses détaillées en cours."""
     points = {}
     try:
-        for (payload,) in db_exec("SELECT payload FROM act_details WHERE v=?", (DETAIL_VERSION,), fetch=True) or []:
-            for pt in _effort_points([json.loads(payload)]):
-                points[pt["id"] or pt["d"]] = pt
+        for r in db_exec("SELECT id, d, nom, pace_s, hr, duree_s FROM efforts", fetch=True) or []:
+            points[r[0]] = {"id": r[0], "d": r[1], "nom": r[2], "pace_s": r[3], "hr": r[4], "duree_s": r[5]}
     except Exception:
         logging.exception("effort_history")
     for pt in _effort_points(details):
-        points[pt["id"] or pt["d"]] = pt
+        points[str(pt["id"] or pt["d"])] = pt
     return sorted(points.values(), key=lambda x: str(x["d"]))
 
 
@@ -761,7 +798,7 @@ def dashboard_lines(prof, well, acts, evts, risk=None):
            "recent": (acts or {}).get("brut_recent", []), "details": (acts or {}).get("detail_dernieres_courses") or [],
            "risk": risk or evaluate_injury_risk(well, acts)}
     out = []
-    for fn in (_dash_recup, _dash_charge, _dash_semaines, _dash_rythme, _dash_allure_facile, _dash_decouplage, _dash_zones,
+    for fn in (_dash_recup, _dash_charge, _dash_semaines, _dash_semaine_plan, _dash_rythme, _dash_allure_facile, _dash_decouplage, _dash_zones,
                _dash_adherence, _dash_objectif, _dash_enveloppe):
         try:
             line = fn(ctx)
@@ -794,6 +831,7 @@ def fetch_activities():
             spd = a.get("average_speed") or 0
             dist = a.get("distance") or 0
             mtime = a.get("moving_time") or 0
+            gear = a.get("gear")
             item = {
                 "id": a.get("id"),
                 "d": d_str,
@@ -805,6 +843,7 @@ def fetch_activities():
                 "hr": _num(a.get("average_heartrate"), 0),
                 "load": _num(a.get("icu_training_load"), 0),
                 "h": str(a.get("start_date_local") or "")[11:16],
+                "shoes": gear.get("name") if isinstance(gear, dict) else None,
             }
             if a.get("type") in RUN_TYPES and dist >= 3000 and spd > 0:
                 runs.append((spd, item))
@@ -908,11 +947,15 @@ def split_wellness(well, days_full=None):
 # DETAIL DES COURSES : laps de la montre, splits km, série seconde par seconde (cache en base)
 # --------------------------------------------------------------------------
 SUMMARY_KEYS = {
-    "max_heartrate": "fc_max", "average_cadence": "cad", "total_elevation_gain": "d+",
+    "max_heartrate": "fc_max", "total_elevation_gain": "d+",
     "decoupling": "decouplage_pct", "icu_efficiency_factor": "ef", "icu_intensity": "intensite",
     "trimp": "trimp", "average_temp": "temp_c", "icu_rpe": "rpe", "feel": "feel",
+    "icu_average_watts": "watts_moy", "icu_weighted_avg_watts": "watts_np", "average_stride": "foulee_m",
 }
-STREAM_TYPES = "time,distance,heartrate,cadence,altitude,velocity_smooth"
+STREAM_TYPES = "time,distance,heartrate,cadence,altitude,velocity_smooth,watts"
+CORE_STREAMS = set(STREAM_TYPES.split(","))
+EXCLUDE_STREAMS = {"latlng", "moving", "grade_smooth", "fixed_watts", "fixed_heartrate", "raw_heartrate", "fixed_altitude",
+                   "torque", "left_right_balance", "epoc", "vam", "temp"}
 
 
 def _num(x, nd=1):
@@ -931,6 +974,13 @@ def _mmss(sec):
     return f"{total // 60}'{total % 60:02d}"
 
 
+def _spm(v):
+    """Cadence de course en pas/min : certains appareils l'enregistrent par jambe (80-95), on double sous 125."""
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or v <= 0:
+        return None
+    return v * 2 if v < 125 else v
+
+
 def _ffill(arr):
     out, last = [], 0
     for v in arr:
@@ -941,6 +991,10 @@ def _ffill(arr):
 
 def _idx_at(times, t):
     return min(max(bisect.bisect_left(times, t), 0), len(times) - 1)
+
+
+def _smart(v):
+    return int(round(v)) if abs(v) >= 100 else (round(v, 1) if abs(v) >= 10 else round(v, 2))
 
 
 def parse_streams(js):
@@ -957,7 +1011,16 @@ def parse_streams(js):
     return out
 
 
-def get_streams(act_id):
+def _stream_types_for(stream_types):
+    """Flux de base + toutes les mesures supplémentaires stockées pour l'activité (puissance, dynamique de course...)."""
+    if not isinstance(stream_types, list) or not stream_types:
+        return STREAM_TYPES
+    base = ["time", "distance"] + [t for t in STREAM_TYPES.split(",") if t in stream_types and t not in ("time", "distance")]
+    extras = [t for t in stream_types if isinstance(t, str) and t not in CORE_STREAMS and t not in EXCLUDE_STREAMS][:8]
+    return ",".join(base + extras)
+
+
+def get_streams(act_id, types=None):
     """Données seconde par seconde d'une activité (cache compressé en base). None si Intervals ne répond pas."""
     row = db_exec("SELECT blob FROM act_streams WHERE id=? AND v=?", (act_id, STREAM_VERSION), fetch=True)
     if row:
@@ -966,7 +1029,7 @@ def get_streams(act_id):
         except Exception:
             logging.warning(f"Cache streams illisible pour {act_id}, nouveau téléchargement")
     s = requests.get(f"{API_ROOT}/activity/{act_id}/streams.json", auth=AUTH,
-                     params={"types": STREAM_TYPES}, timeout=25)
+                     params={"types": types or STREAM_TYPES}, timeout=25)
     time.sleep(0.15)
     if s.status_code != 200:
         logging.warning(f"Streams activité {act_id} : HTTP {s.status_code}")
@@ -982,7 +1045,7 @@ def get_streams(act_id):
 
 
 def compute_km_splits(streams):
-    """Splits au kilomètre : allure, FC moyenne, cadence, dénivelé net. Dernier tronçon inclus s'il fait 300 m et plus."""
+    """Splits au kilomètre : allure, FC, cadence (pas/min), puissance, dénivelé net. Dernier tronçon inclus s'il fait 300 m et plus."""
     t = _ffill(streams.get("time") or [])
     d = _ffill(streams.get("distance") or [])
     n = min(len(t), len(d))
@@ -991,15 +1054,19 @@ def compute_km_splits(streams):
     hr = streams.get("heartrate") or []
     cad = streams.get("cadence") or []
     alt = streams.get("altitude") or []
+    watts = streams.get("watts") or []
 
     def stats(i_from, i_to):
         row = {}
         h = _mean(hr[i_from + 1:i_to + 1])
-        c = _mean(cad[i_from + 1:i_to + 1])
+        c = _spm(_mean(cad[i_from + 1:i_to + 1]))
+        w = _mean(watts[i_from + 1:i_to + 1])
         if h:
             row["hr"] = int(round(h))
         if c:
             row["cad"] = int(round(c))
+        if w:
+            row["w"] = int(round(w))
         if i_from < len(alt) and i_to < len(alt) and isinstance(alt[i_from], (int, float)) and isinstance(alt[i_to], (int, float)):
             row["d_alt"] = int(round(alt[i_to] - alt[i_from]))
         return row
@@ -1023,6 +1090,93 @@ def compute_km_splits(streams):
     return splits
 
 
+def _pctile(sorted_vals, q):
+    return sorted_vals[int(q * (len(sorted_vals) - 1))]
+
+
+def phase_summary(streams):
+    """Séance découpée en 3 tiers (durée égale) : allure, FC moyenne et plage (5e-95e centile), cadence, puissance."""
+    t = _ffill(streams.get("time") or [])
+    d = _ffill(streams.get("distance") or [])
+    n = min(len(t), len(d))
+    if n < 600 or t[n - 1] - t[0] < 600:
+        return None
+    t, d = t[:n], d[:n]
+    hr, cad, watts = streams.get("heartrate") or [], streams.get("cadence") or [], streams.get("watts") or []
+    t0, dur = t[0], t[n - 1] - t[0]
+    cuts = [0] + [_idx_at(t, t0 + dur * k / 3) for k in (1, 2)] + [n - 1]
+    rows = []
+    for k in range(3):
+        i0, i1 = cuts[k], cuts[k + 1]
+        if i1 <= i0:
+            continue
+        dist, sec = d[i1] - d[i0], t[i1] - t[i0]
+        row = {"ph": f"{round((t[i0] - t0) / 60)}-{round((t[i1] - t0) / 60)} min", "km": f"{d[i0] / 1000:.1f}-{d[i1] / 1000:.1f}"}
+        if dist > 0 and sec > 0:
+            row["pace"] = _mmss(sec / dist * 1000)
+        h = sorted(v for v in hr[i0:i1 + 1] if isinstance(v, (int, float)) and v > 40)
+        if h:
+            row["fc"] = int(round(sum(h) / len(h)))
+            row["fc_plage"] = f"{int(_pctile(h, 0.05))}-{int(_pctile(h, 0.95))}"
+        c = _spm(_mean(cad[i0:i1 + 1]))
+        w = _mean(watts[i0:i1 + 1])
+        if c:
+            row["cad"] = int(round(c))
+        if w:
+            row["w"] = int(round(w))
+        rows.append(row)
+    return rows or None
+
+
+def hr_cumul(hr):
+    """Part du temps passée sous une FC donnée, par paliers de 5 bpm (ex. '≤140 25 % | ≤145 62 % | ≤150 98 %')."""
+    vals = sorted(v for v in hr if isinstance(v, (int, float)) and v > 40)
+    n = len(vals)
+    if n < 120:
+        return None
+    b = int(_pctile(vals, 0.05) // 5 * 5) + 5
+    parts = []
+    while b <= int(vals[-1] // 5 * 5) + 5:
+        pct = bisect.bisect_right(vals, b) * 100 / n
+        parts.append(f"≤{b} {pct:.0f} %")
+        if pct >= 99.5:
+            break
+        b += 5
+    return " | ".join(parts)
+
+
+def hr_peak(streams):
+    t, hr = streams.get("time") or [], streams.get("heartrate") or []
+    n = min(len(t), len(hr))
+    pts = [(hr[i], i) for i in range(n) if isinstance(hr[i], (int, float)) and hr[i] > 40]
+    if not pts:
+        return None
+    v, i = max(pts)
+    t0 = t[0] if isinstance(t[0], (int, float)) else 0
+    return {"fc": int(v), "min": round(((t[i] if isinstance(t[i], (int, float)) else 0) - t0) / 60)}
+
+
+def dynamics_summary(streams):
+    """Mesures supplémentaires du fichier (puissance, temps de contact, oscillation, longueur de foulée...) : moyenne,
+    plage 5e-95e centile, 1er tiers → dernier tiers et dérive en %. Les noms et unités sont ceux du fichier."""
+    out = {}
+    for name, arr in streams.items():
+        if name in ("time", "distance", "altitude", "velocity_smooth", "heartrate"):
+            continue
+        pos = [v for v in arr if isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0]
+        if len(pos) < 90:
+            continue
+        if name == "cadence":
+            pos = [_spm(v) for v in pos]
+        srt = sorted(pos)
+        k = len(pos) // 3
+        first, last, mean = sum(pos[:k]) / k, sum(pos[-k:]) / k, sum(pos) / len(pos)
+        out["cad_spm" if name == "cadence" else name] = {
+            "moy": _smart(mean), "p5": _smart(_pctile(srt, 0.05)), "p95": _smart(_pctile(srt, 0.95)),
+            "t1": _smart(first), "t3": _smart(last), "derive_pct": round((last / first - 1) * 100, 1)}
+    return out
+
+
 def _lap_rows(intervals):
     rows = []
     for idx, iv in enumerate(intervals[:MAX_LAPS], 1):
@@ -1033,7 +1187,8 @@ def _lap_rows(intervals):
             "n": idx, "type": iv.get("type"), "label": iv.get("label"), "debut_s": _num(iv.get("start_time"), 0),
             "duree_s": _num(mt, 0), "km": round(dist / 1000, 2), "pace": _pace(spd),
             "hr": _num(iv.get("average_heartrate"), 0), "hr_max": _num(iv.get("max_heartrate"), 0),
-            "cad": _num(iv.get("average_cadence"), 0), "d+": _num(iv.get("total_elevation_gain"), 0),
+            "cad": _num(_spm(iv.get("average_cadence")), 0), "d+": _num(iv.get("total_elevation_gain"), 0),
+            "w": _num(iv.get("average_watts"), 0), "foulee": _num(iv.get("average_stride"), 2),
         }
         rows.append({k: v for k, v in row.items() if v is not None})
     return rows
@@ -1101,16 +1256,19 @@ def fetch_run_detail(item):
 
     detail = {"id": act_id, "d": item.get("d"), "nom": item.get("nom")}
     got_any = False
-    laps, raw_intervals = [], []
+    laps, raw_intervals, stream_types = [], [], None
     try:
         r = requests.get(f"{API_ROOT}/activity/{act_id}", auth=AUTH, params={"intervals": "true"}, timeout=12)
         if r.status_code == 200:
             got_any = True
             a = r.json()
             for src, dst in SUMMARY_KEYS.items():
-                v = _num(a.get(src), 1)
+                v = _num(a.get(src), 2 if dst == "foulee_m" else 1)
                 if v is not None:
                     detail[dst] = v
+            cad = _num(_spm(a.get("average_cadence")), 0)
+            if cad:
+                detail["cad"] = cad
             gap = a.get("gap")
             if isinstance(gap, (int, float)) and gap > 0:
                 detail["gap"] = _pace(gap)
@@ -1119,13 +1277,14 @@ def fetch_run_detail(item):
                 detail["temps_zones_fc_s"] = [int(x) if isinstance(x, (int, float)) else 0 for x in zt]
             if a.get("description"):
                 detail["notes"] = str(a["description"])[:300]
+            stream_types = a.get("stream_types")
             raw_intervals = (a.get("icu_intervals") or [])[:MAX_LAPS]
             laps = _lap_rows(raw_intervals)
         else:
             logging.warning(f"Détail activité {act_id} : HTTP {r.status_code}")
         time.sleep(0.15)
 
-        streams = get_streams(act_id)
+        streams = get_streams(act_id, _stream_types_for(stream_types))
         if streams:
             got_any = True
             km = compute_km_splits(streams)
@@ -1133,6 +1292,19 @@ def fetch_run_detail(item):
                 detail["km"] = km
             if laps:
                 minute_breakdown(streams, raw_intervals, laps)
+            if sum(1 for lp in laps if lp.get("type") == "WORK") < 2:     # séance continue : lecture par tiers
+                ph = phase_summary(streams)
+                if ph:
+                    detail["phases"] = ph
+            cum = hr_cumul(streams.get("heartrate") or [])
+            if cum:
+                detail["fc_cumul"] = cum
+            pk = hr_peak(streams)
+            if pk:
+                detail["pic_fc"] = pk
+            dyn = dynamics_summary(streams)
+            if dyn:
+                detail["dyn"] = dyn
         if laps:
             detail["laps"] = laps
     except Exception as err:
@@ -1147,6 +1319,8 @@ def fetch_run_detail(item):
     if got_any and (detail.get("laps") or detail.get("km") or age > 2):
         db_exec("INSERT OR REPLACE INTO act_details (id, v, payload) VALUES (?, ?, ?)",
                 (act_id, DETAIL_VERSION, json.dumps(detail, ensure_ascii=False)))
+        for pt in _effort_points([detail]):
+            save_effort(pt)
     return detail
 
 
@@ -1159,13 +1333,15 @@ def fetch_run_details(acts):
         except Exception:
             logging.exception("fetch_run_detail")
             continue
-        if i >= DETAIL_FULL:
-            det = {k: v for k, v in det.items() if k != "km"}
+        if i >= DETAIL_FULL:      # courses plus anciennes : résumé, laps (sans splits, phases ni dynamique)
+            det = {k: v for k, v in det.items() if k not in ("km", "phases", "dyn", "fc_cumul", "pic_fc")}
+        if a.get("shoes"):
+            det = dict(det, chaussures=a["shoes"])
         out.append(det)
     return out
 
 
-def build_series_csv(streams, laps=None, full=False):
+def build_series_csv(streams, laps=None, full=False, step_s=None):
     """CSV de la séance : 1 ligne toutes les STREAM_STEP_S secondes (ou chaque seconde si full). Retourne (csv, pas, nb_lignes)."""
     t = _ffill(streams.get("time") or [])
     d = _ffill(streams.get("distance") or [])
@@ -1181,7 +1357,7 @@ def build_series_csv(streams, laps=None, full=False):
     if dur <= 0:
         return None
 
-    step = 1 if full else max(1, STREAM_STEP_S)
+    step = 1 if full else max(1, step_s or STREAM_STEP_S)
     max_rows = SERIES_FULL_MAX_ROWS if full else SERIES_MAX_ROWS
     if dur / step > max_rows:
         step = int(-(-dur // max_rows))
@@ -1197,7 +1373,7 @@ def build_series_csv(streams, laps=None, full=False):
     def emit(wid, idxs):
         i_last = idxs[-1]
         h = _mean([hr[i] for i in idxs if i < len(hr)])
-        c = _mean([cad[i] for i in idxs if i < len(cad)])
+        c = _spm(_mean([cad[i] for i in idxs if i < len(cad)]))
         v = _mean([vel[i] for i in idxs if i < len(vel)])
         dt, dd = t[i_last] - state["t"], d[i_last] - state["d"]
         if not v and dt > 0 and dd > 0:
@@ -1230,13 +1406,49 @@ def build_series_csv(streams, laps=None, full=False):
     return "\n".join(lines), step, len(lines) - 1
 
 
-# Quand joindre le CSV de la séance au prompt (sans appel Gemini supplémentaire)
-_ANALYSE = re.compile(
-    r"analys|détail|detail|fraction|\blaps?\b|\btours?\b|interval|\bbloc|bpm|\bfc\b|cardiaque|allure|rythme|dérive|derive|"
-    r"régularit|regularit|seuil|tempo|\bcsv\b|seconde|\bbrut|respect|\bcap\b|sortie|course|footing|débrief|debrief|"
-    r"\bvma\b|cadence|foulée|foulee", re.I)
-_PLANIF = re.compile(r"planifi|programme|ajoute|supprime|déplace|deplace|décale|decale|annule|remplace|reporte|restaure|indispo", re.I)
+# --------------------------------------------------------------------------
+# MODE DE RÉPONSE : le code décide si l'athlète converse, pose une question, demande une analyse...
+# (avant : n'importe quel message contenant « footing » ou « FC » déclenchait une analyse complète)
+# --------------------------------------------------------------------------
+_STRONG_ANALYSE = re.compile(
+    r"analys|en d[ée]tail|d[ée]taill|ai[- ]je respect|a[- ]t[- ]on respect|\bcsv\b|seconde par seconde|\bcompar(?:e|er|aison)\b|"
+    r"d[ée]brief|qu'?en penses[- ]tu de (?:ma|la) (?:s[ée]ance|course|sortie|cap)|"
+    r"comment (?:s'est pass[ée]e|[ée]tait) (?:ma|la) (?:s[ée]ance|course|sortie)", re.I)
+_TOPIC_ANALYSE = re.compile(r"\blaps?\b|fraction|d[ée]rive|d[ée]couplage|r[ée]gularit|\bfc\b|bpm|allure|rythme|cardiaque", re.I)
+_IMPERATIF = re.compile(r"\b(?:regarde|v[ée]rifie|dis[- ]moi|montre|donne[- ]moi|explique|pr[ée]cise|peux[- ]tu|pourrais[- ]tu|tu peux)\b", re.I)
+_QUESTION_START = re.compile(
+    r"^\s*(?:comment|pourquoi|quand|combien|quel|quelle|quels|quelles|est[- ]ce|puis[- ]je|peux[- ]tu|pourrais[- ]tu|dois[- ]je|"
+    r"tu penses|que penses|qu'est[- ]ce|o[ùu])\b", re.I)
+_BRIEF_RE = re.compile(r"bilan matinal|bilan du matin|brief (?:du )?(?:matin|r[ée]veil)|point du matin|recommence le (?:bilan|brief)", re.I)
+_BILAN_RE = re.compile(r"bilan (?:de la )?semaine|bilan hebdo", re.I)
+_PLANIF_REQ = re.compile(
+    r"\b(?:planifie|programme|ajoute|supprime|d[ée]place|d[ée]cale|annule|remplace|reporte|restaure|retire)\b"
+    r"|(?:peux[- ]tu|pourrais[- ]tu|tu peux|stp|s'il te pla[iî]t|je voudrais|je veux|j'aimerais).{0,60}"
+    r"\b(?:planifier|programmer|ajouter|supprimer|d[ée]placer|d[ée]caler|annuler|remplacer|reporter|retirer)\b", re.I | re.S)
 _FULLRES = re.compile(r"seconde par seconde|\b1 ?hz\b|\bcsv\b|\bbrut|complet|toutes? les donn|tout le d[ée]tail", re.I)
+
+
+def detect_mode(msg):
+    """CONVERSATION | QUESTION | ANALYSE | PLANIFICATION | BRIEF | BILAN | DEBRIEF | LIBRE (vocal)."""
+    low = (msg or "").strip().lower()
+    if low.startswith("débrief séance terminée"):
+        return "DEBRIEF"
+    if low.startswith("brief réveil"):
+        return "BRIEF"
+    if low.startswith("c'est dimanche soir"):
+        return "BILAN"
+    if low.startswith("message vocal"):
+        return "LIBRE"
+    if _BRIEF_RE.search(low):
+        return "BRIEF"
+    if _BILAN_RE.search(low):
+        return "BILAN"
+    if _PLANIF_REQ.search(low):
+        return "PLANIFICATION"
+    question = "?" in low or bool(_QUESTION_START.search(low))
+    if _STRONG_ANALYSE.search(low) or (_TOPIC_ANALYSE.search(low) and (question or _IMPERATIF.search(low))):
+        return "ANALYSE"
+    return "QUESTION" if question else "CONVERSATION"
 
 
 def resolve_msg_date(msg):
@@ -1299,17 +1511,19 @@ def build_series_block(acts, msg, series="auto"):
         if series.get("type") not in RUN_TYPES:
             return ""
         run, warn = series, None
+        step_s = 10      # débrief automatique : résolution plus grossière (phases, pic et dynamique déjà calculés)
     else:
-        if not _ANALYSE.search(msg or "") or _PLANIF.search(msg or ""):
+        if detect_mode(msg) != "ANALYSE":
             return ""
         run, warn = pick_target_run(msg, runs)
+        step_s = None
     full = bool(_FULLRES.search(msg or ""))
     if not run:
         return f"SÉRIE DÉTAILLÉE : {warn}"
     try:
+        laps = fetch_run_detail(run).get("laps")      # d'abord : met en cache les flux complets (puissance, dynamique)
         streams = get_streams(str(run["id"]))
-        laps = fetch_run_detail(run).get("laps") if streams else None
-        res = build_series_csv(streams, laps, full) if streams else None
+        res = build_series_csv(streams, laps, full, step_s) if streams else None
     except Exception:
         logging.exception("build_series_block")
         res = None
@@ -1317,8 +1531,22 @@ def build_series_block(acts, msg, series="auto"):
         return f"SÉRIE DÉTAILLÉE : indisponible pour '{run.get('nom')}' du {run.get('d')} (données seconde par seconde absentes ou illisibles)."
     csv_text, step, nrows = res
     return (f"SÉRIE DÉTAILLÉE (CSV de la séance '{run.get('nom')}' du {run.get('d')} : 1 ligne toutes les {step} s, {nrows} lignes ; "
-            f"t_s = secondes depuis le départ, allure en m'ss/km (vide à l'arrêt), fc en bpm, cad = cadence, alt_m = altitude, "
+            f"t_s = secondes depuis le départ, allure en m'ss/km (vide à l'arrêt), fc en bpm, cad = pas par minute, alt_m = altitude, "
             f"lap = numéro du lap du bloc DÉTAIL) :\n{csv_text}")
+
+
+def fetch_gear():
+    """Matériel suivi dans Intervals (chaussures...). Liste vide si la fonction n'est pas utilisée."""
+    try:
+        r = requests.get(f"{BASE}/gear", auth=AUTH, timeout=8)
+        if r.status_code == 200 and isinstance(r.json(), list):
+            return [f"{g.get('name')} ({g.get('type') or '?'}) : {round((g.get('distance') or 0) / 1000)} km"
+                    for g in r.json() if not g.get("retired")][:8]
+        if r.status_code not in (200, 404):
+            logging.warning(f"fetch_gear : HTTP {r.status_code}")
+    except Exception as err:
+        logging.error(f"Erreur fetch_gear : {err}")
+    return []
 
 
 _DATA_CACHE = {"t": 0.0, "v": None}
@@ -1335,7 +1563,11 @@ def _load_all_data():
     f_well = POOL.submit(fetch_wellness)
     f_acts = POOL.submit(fetch_activities)
     f_evts = POOL.submit(fetch_events)
+    f_gear = POOL.submit(fetch_gear)
     prof = f_prof.result()
+    gear = f_gear.result()
+    if gear:
+        prof = dict(prof, materiel=gear)
     weather = fetch_weather(prof.get("city") or DEFAULT_CITY)
     acts = f_acts.result()
     acts["detail_dernieres_courses"] = fetch_run_details(acts)
@@ -1611,55 +1843,48 @@ TOOLS_MAP = {f.__name__: f for f in TOOLS}
 # --------------------------------------------------------------------------
 # GEMINI
 # --------------------------------------------------------------------------
-SYSTEM_INSTRUCTION = (
-    "Tu es l'entraîneur personnel de course à pied de cet athlète : un expert de la physiologie de l'endurance et de la gestion "
-    "de la charge d'entraînement. Tu réponds en français, directement, avec des analyses chiffrées et argumentées, jamais des "
-    "conseils génériques.\n"
-    "RÈGLES :\n"
-    "1. Données : les listes sont triées du plus récent au plus ancien ; la première ligne de santé peut être incomplète (nuit du jour "
-    "pas encore synchronisée). Le TABLEAU DE BORD est calculé par le code : cite ses chiffres, ne les recalcule pas. Appuie chaque "
-    "conseil sur les données de l'athlète (allures et FC réellement observées, laps, tendances). N'invente jamais une allure ou une "
-    "FC cible : justifie-la par ses propres données (allure facile observée à FC basse, zones du profil, laps d'effort).\n"
-    "2. Alerte surcharge : suis la consigne du bloc SURVEILLANCE. Une alerte déjà communiquée n'est JAMAIS répétée, ni en cours de "
-    "message ni en conclusion. Le ratio ATL/CTL est gonflé après une coupure (CTL bas) : juge la charge sur la rampe de CTL, la "
-    "progression hebdomadaire, la charge glissante et les signaux physiologiques, pas sur un seul ratio. Si les signaux se "
-    "contredisent, dis-le.\n"
-    "3. Pour modifier le calendrier, appelle l'outil (planifier_seance, deplacer_seance, supprimer_seance, gerer_indisponibilite, "
-    "restaurer_suppression). Ne dis JAMAIS qu'une séance est planifiée, déplacée ou supprimée sans avoir appelé l'outil. N'appelle "
-    "aucun outil quand l'athlète demande seulement un conseil ou une analyse.\n"
-    "4. Donne toujours les dates aux outils au format AAAA-MM-JJ, en t'appuyant sur les repères de dates fournis.\n"
-    "5. Format Telegram HTML : uniquement <b>, <i> et <code>. Aère avec des lignes vides. Aucun Markdown (pas de #, pas de **), "
-    "aucune autre balise.\n"
-    "6. Si l'athlète mentionne un fait durable (blessure, contrainte, préférence, déplacement), termine ton message par une ligne : "
-    "[MEMOIRE] fait à retenir\n"
-    "7. Tu n'es pas médecin : en cas de douleur persistante ou de symptôme inquiétant, recommande de consulter.\n"
-    "8. Pour analyser une séance, utilise le bloc DÉTAIL DES DERNIÈRES COURSES : cite les chiffres lap par lap, minute par minute "
-    "(par_min = allure/FC) et km par km, compare-les aux allures et durées prévues dans la description de la séance du CALENDRIER "
-    "à la même date, puis conclus précisément. Ne dis jamais que tu n'as pas accès aux détails quand ces données sont présentes.\n"
-    "9. Si un bloc SÉRIE DÉTAILLÉE est fourni, c'est le CSV de la séance : exploite-le point par point (la colonne lap renvoie aux "
-    "laps du bloc DÉTAIL). S'il n'est pas fourni et que l'analyse demande ce niveau de finesse, invite l'athlète à écrire "
-    "« analyse détaillée de [la séance ou la date] » (ajouter « csv complet » pour avoir la seconde par seconde).\n"
-    "10. Structure selon le message. BRIEF RÉVEIL : (a) récupération chiffrée par rapport à ses références ; (b) charge et tendance ; "
-    "(c) séance du jour : la garder ou l'adapter, avec une prescription précise (durée, allure ou plage de FC justifiée par ses "
-    "données, météo du créneau si elle compte) ; (d) un seul point de vigilance ; (e) objectif : une seule ligne, uniquement le "
-    "lundi ou si un indicateur a nettement bougé. DÉBRIEF DE SÉANCE : (a) exécution par rapport aux consignes du calendrier, lap "
-    "par lap ; (b) coût physiologique (FC, dérive, découplage, régularité) ; (c) ce que cela dit de la progression vers l'objectif ; "
-    "(d) impact sur les 2 à 3 prochains jours. BILAN HEBDOMADAIRE : (a) volume réalisé par rapport à l'enveloppe, charge, fatigue, "
-    "adhérence au plan ; (b) section OBJECTIF détaillée à partir de la ligne OBJECTIF du tableau de bord : estimation actuelle du "
-    "5 km, écart, progression nécessaire par semaine, tendance, verdict honnête sur la faisabilité (ni complaisant ni alarmiste) et "
-    "ajustement du plan si besoin ; (c) les 3 séances clés de la semaine à venir, dans l'enveloppe de charge. QUESTION LIBRE : "
-    "réponds d'abord à la question, puis seulement le contexte qui change ta réponse.\n"
-    "11. Planification : avant de planifier ou de valider une séance ou un volume, vérifie l'ENVELOPPE DE CHARGE. Si la demande la "
-    "dépasse, dis-le avec les chiffres et propose une alternative qui rentre dans l'enveloppe. Si l'athlète insiste, planifie "
-    "quand même en précisant le risque : c'est lui qui décide.\n"
-    "12. Météo : l'heure locale est fournie. Pour « dans 1 h », « ce soir », « demain matin », utilise le tableau MÉTÉO HEURE PAR "
-    "HEURE et les créneaux favorables ; réponds avec les chiffres de l'heure demandée (ressenti, pluie, vent) et un conseil "
-    "concret (tenue, créneau).\n"
-    "13. Raisonne sur le fond : si des données manquent ou se contredisent, dis-le et donne l'hypothèse la plus probable plutôt "
-    "que d'affirmer. Sois dense : chaque phrase apporte un chiffre ou une décision, sans préambule ni remplissage. Longueur selon "
-    "le besoin : 150 à 250 mots pour un brief ou une réponse d'analyse, jusqu'à 400 mots pour un débrief de séance, 500 pour le "
-    "bilan hebdomadaire."
-)
+SYSTEM_INSTRUCTION = """Tu es le coach personnel de course à pied de cet athlète, pas un tableau de bord. Tu as l'oeil d'un expert (physiologie de l'endurance, gestion de la charge, biomécanique) et la chaleur d'un coach qui connaît son athlète depuis des mois. Tu le tutoies et, si le champ prenom du PROFIL existe, tu l'appelles par son prénom de temps en temps. Tu écris un français naturel et vivant : phrases variées, humour léger quand il s'y prête, 0 à 2 émojis au maximum.
+
+PERSONNALITÉ
+- Tu écoutes d'abord. Quand l'athlète te raconte quelque chose (sensation, fierté, doute, matériel, anecdote, taquinerie), tu réagis à ce qu'il dit, avec ses mots, avant tout chiffre, et tu relèves ce qu'il y a derrière.
+- Tu as un avis et tu l'assumes, avec nuance. Tu félicites précisément (ce qui est bon et pourquoi) et tu challenges honnêtement. Quand ses sensations contredisent les indicateurs et que les faits lui donnent raison, tu le reconnais franchement : l'ACWR et les autres ratios sont des outils, pas des vérités. Tu notes alors ce que tu apprends de lui.
+- Tu te souviens : tu t'appuies sur l'historique de conversation, la MÉMOIRE DURABLE, le matériel et le calendrier, et tu le montres naturellement (chaussures, préférences, contraintes de la semaine). Tu ne répètes jamais des chiffres déjà donnés dans les derniers messages, sauf demande, et tu ne réutilises pas la structure de tes messages précédents.
+- Au plus UNE question par message, seulement si la réponse changerait ton conseil (jambes, douleur, sommeil, stress, contraintes). Jamais de question pour la forme.
+
+RÈGLES
+1. Données : les listes sont triées du plus récent au plus ancien ; la première ligne de santé peut être incomplète (nuit du jour pas encore synchronisée). Le TABLEAU DE BORD est calculé par le code : cite ses chiffres, ne les recalcule pas. Appuie chaque conseil sur les données de l'athlète (allures et FC réellement observées, laps, phases, tendances). N'invente jamais une allure ou une FC cible : justifie-la par ses propres données. cad_spm est en pas par minute. Unités de la dynamique de course : stance_time (temps de contact au sol) en ms, vertical_oscillation en mm (divise par 10 pour des cm), step_length en mm (divise par 1000 pour des m), vertical_ratio en %, watts en W ; présente-les dans ces unités lisibles.
+2. Alerte surcharge : suis la consigne du bloc SURVEILLANCE. Une alerte déjà communiquée n'est JAMAIS répétée, ni en cours de message ni en conclusion. Le ratio ATL/CTL est gonflé après une coupure (CTL bas) : juge la charge sur la rampe de CTL, la progression hebdomadaire, la charge glissante et les signaux physiologiques, pas sur un seul ratio. Si les signaux se contredisent, dis-le.
+3. Pour modifier le calendrier, appelle l'outil (planifier_seance, deplacer_seance, supprimer_seance, gerer_indisponibilite, restaurer_suppression). Ne dis JAMAIS qu'une séance est planifiée, déplacée ou supprimée sans avoir appelé l'outil. N'appelle aucun outil quand l'athlète demande seulement un conseil ou une analyse, ni dans les modes BRIEF, DEBRIEF et BILAN (messages automatiques).
+4. Donne toujours les dates aux outils au format AAAA-MM-JJ, en t'appuyant sur les repères de dates fournis.
+5. Format Telegram HTML : uniquement <b>, <i> et <code>, aucun Markdown (pas de #, pas de **), aucune autre balise. Pour les listes courtes, utilise des puces « • ».
+6. Mémoire : pour chaque fait durable (blessure, matériel et kilométrage, préférence, contrainte, façon dont l'athlète réagit à l'entraînement), ajoute en fin de message une ligne [MEMOIRE] fait à retenir. Plusieurs lignes possibles.
+7. Tu n'es pas médecin : en cas de douleur persistante ou de symptôme inquiétant, recommande de consulter.
+8. Si un bloc SÉRIE DÉTAILLÉE est fourni, c'est le CSV de la séance : exploite-le point par point (la colonne lap renvoie aux laps du bloc DÉTAIL). Si une analyse demande ce niveau de finesse et qu'il n'est pas fourni, invite l'athlète à écrire « analyse détaillée de [la séance ou la date] » (ajouter « csv complet » pour la seconde par seconde).
+9. Planification : avant de planifier ou de valider une séance ou un volume, vérifie l'ENVELOPPE DE CHARGE. Si la demande la dépasse, dis-le avec les chiffres et propose une alternative qui rentre dans l'enveloppe. Si l'athlète insiste, planifie quand même en précisant le risque : c'est lui qui décide.
+10. Météo : l'heure locale est fournie. Pour « dans 1 h », « ce soir », « demain matin », utilise le tableau MÉTÉO HEURE PAR HEURE et les créneaux favorables ; réponds avec les chiffres de l'heure demandée (ressenti, pluie, vent) et un conseil concret (tenue, créneau).
+11. Si des données manquent ou se contredisent, dis-le et donne l'hypothèse la plus probable plutôt que d'affirmer. Chaque phrase doit servir : un fait, une décision, une émotion reconnue ou une question, jamais de remplissage.
+
+MODES (la ligne MODE DE RÉPONSE du message indique lequel appliquer)
+- CONVERSATION : l'athlète partage quelque chose. Réagis d'abord à ce qu'il dit, comme un coach qui l'écoute ; réponds aux sous-entendus ; apporte UNE valeur de coach liée à ses propos (ce que cela révèle, un conseil précis sur le matériel, la récupération, la suite). 1 ou 2 chiffres au maximum, seulement s'ils éclairent ce qu'il dit. Aucun titre, aucune liste, aucun bilan de séance, aucun rappel des splits. 40 à 120 mots.
+- QUESTION : réponds franchement à la question dès la première phrase, puis donne le contexte chiffré qui compte. 60 à 180 mots.
+- DEBRIEF (séance qui vient de se terminer, message automatique) et ANALYSE (l'athlète demande l'analyse d'une séance) : écris un vrai brief de course, en sections numérotées dont le titre est en gras (<b>1. Vue d'ensemble</b>) :
+  1. Vue d'ensemble : une phrase de verdict qui accroche, puis quelques puces avec les valeurs clés en gras (distance, durée, allure moyenne, FC moyenne et max, puissance et cadence en pas/min si disponibles).
+  2. Respect du plan et gestion de l'allure : consigne du calendrier par rapport au réalisé, et le choix de l'athlète (ce qu'il a bien décidé, ou pas).
+  3. Réponse cardiaque et dérive : raconte la séance par phases (minutes ou km, plages de FC), en partant de l'enjeu que pose le contexte (séance dure récente, fatigue, chaleur) : « le risque était X, les chiffres montrent Y ». Ajoute la part du temps sous la FC cible (fc_cumul), le pic de FC et son moment, la dérive ou le découplage. Pour une séance à intervalles, lap par lap et minute par minute (par_min).
+  4. Économie de course : seulement si cadence, puissance ou dynamique de course sont fournies. Stabilité du premier au dernier tiers (dérive en %) et ce que cela dit des muscles et des tendons.
+  5. Bilan pour l'objectif et suite du programme : ce que la séance valide dans la semaine (SEMAINE EN COURS), l'effet sur l'objectif, puis « Pour la suite » avec les prochaines séances du calendrier, leurs consignes et ce qu'il faut surveiller.
+  Pas de liste des splits km par km sauf anomalie. N'ouvre jamais par l'alerte de surcharge : si elle est active et pas encore donnée, une phrase dans la section 5. Termine par UNE question courte sur les sensations (jambes, souffle, douleurs), que les données ne disent pas. 300 à 450 mots. Pour une ANALYSE sur un point précis (« ai-je respecté les fractions ? »), réponds d'abord à ce point avec les chiffres lap par lap, puis le brief condensé.
+- BRIEF (matin) : commence par une phrase humaine sur ce qui compte le plus ce matin, puis (a) récupération chiffrée par rapport à ses références ; (b) charge et tendance ; (c) séance du jour : la garder ou l'adapter, avec une prescription précise (durée, allure ou plage de FC justifiée par ses données, météo du créneau si elle compte) ; (d) un seul point de vigilance ; (e) objectif : une seule ligne, uniquement le lundi ou si un indicateur a nettement bougé. 150 à 250 mots, intertitres courts en gras autorisés.
+- BILAN (hebdomadaire) : (a) volume réalisé par rapport à l'enveloppe, charge, fatigue, adhérence au plan ; (b) section OBJECTIF détaillée à partir de la ligne OBJECTIF du tableau de bord : estimation actuelle du 5 km, écart, progression nécessaire par semaine, tendance, verdict honnête sur la faisabilité (ni complaisant ni alarmiste) et ajustement du plan si besoin ; (c) les 3 séances clés de la semaine à venir, dans l'enveloppe de charge. 300 à 500 mots.
+- PLANIFICATION : vérifie l'ENVELOPPE DE CHARGE, appelle l'outil, puis confirme en 1 à 3 phrases (ou explique ce qui dépasse l'enveloppe et propose une alternative).
+- LIBRE (message vocal) : déduis le mode du contenu de l'audio.
+
+EXEMPLES DE TON (à ne pas recopier)
+Athlète : « Super sortie, j'ai tenu mon cœur bas sans forcer, et mes vieilles chaussures (500 km) sont toujours aussi bonnes ! »
+Coach : « Ça, c'est le genre de séance qui fait plaisir : même allure qu'il y a deux semaines avec un cœur plus bas, ton moteur aérobie avance. Pour les chaussures, 500 km c'est encore la zone confortable ; garde-les pour le foncier et les sorties longues, et réserve les plus vives pour jeudi. Les mollets, ils disent quoi ce soir ? »
+Athlète : « Tu vois, je t'avais dit que je pouvais y aller ! »
+Coach : « Touché, tu avais raison : sur cette séance tes sensations ont battu mes indicateurs. J'en retiens que tu encaisses bien les hausses de charge à allure facile. Je reste prudent pour les séances de seuil, mais je te fais plus confiance qu'hier.
+[MEMOIRE] encaisse bien les hausses de charge à allure facile (l'ACWR a surestimé le risque) »"""
 
 
 def _retry_delay(err_str):
@@ -1821,8 +2046,10 @@ def _cell(v):
     return str(v).replace('"/km', "").replace('"', "'").replace(",", ";").replace("\r", " ").replace("\n", " | ").strip()
 
 
-def _table(rows, cols):
+def _table(rows, cols, drop_empty=False):
     """CSV compact : l'en-tête n'est écrit qu'une fois (un JSON répète chaque nom de champ à chaque ligne)."""
+    if drop_empty:
+        cols = [c for i, c in enumerate(cols) if i == 0 or any(_cell(r.get(c[1])) != "" for r in rows)]
     lines = [",".join(h for h, _ in cols)]
     lines += [",".join(_cell(r.get(k)) for _, k in cols) for r in rows]
     return "\n".join(lines)
@@ -1843,27 +2070,41 @@ WEEK_COLS = [("semaine", "semaine"), ("seances", "seances"), ("km", "km_total"),
 TOP_COLS = [("allure", "allure"), ("km", "distance_km"), ("date", "date"), ("nom", "nom")]
 EVT_COLS = [("d", "d"), ("h", "h"), ("cat", "category"), ("nom", "nom"), ("description", "desc")]
 LAP_COLS = [("n", "n"), ("type", "type"), ("label", "label"), ("debut_s", "debut_s"), ("duree_s", "duree_s"), ("km", "km"),
-            ("allure", "pace"), ("fc", "hr"), ("fc_max", "hr_max"), ("cad", "cad"), ("d+", "d+"), ("par_min", "par_min")]
-KM_COLS = [("km", "km"), ("allure", "pace"), ("fc", "hr"), ("cad", "cad"), ("d_alt", "d_alt")]
+            ("allure", "pace"), ("fc", "hr"), ("fc_max", "hr_max"), ("cad_spm", "cad"), ("w", "w"), ("foulee_m", "foulee"),
+            ("d+", "d+"), ("par_min", "par_min")]
+KM_COLS = [("km", "km"), ("allure", "pace"), ("fc", "hr"), ("cad_spm", "cad"), ("w", "w"), ("d_alt", "d_alt")]
+PHASE_COLS = [("phase", "ph"), ("km", "km"), ("allure", "pace"), ("fc", "fc"), ("fc_plage", "fc_plage"), ("cad_spm", "cad"), ("w", "w")]
 WEATHER_COLS = [("heure", "h"), ("temp", "temp_c"), ("ressenti", "ress_c"), ("pluie_pct", "pluie_pct"), ("pluie_mm", "pluie_mm"), ("vent_kmh", "vent_kmh")]
 
 
 def format_run_details(details):
-    """Laps et splits km de chaque course, en petits tableaux CSV."""
+    """Laps, phases, FC cumulée, dynamique de course et splits km de chaque course, en petits tableaux CSV."""
     out = []
+    labels = {"cad": "cad_spm"}
     for d in details or []:
-        extras = [f"{k}={_cell(d[k])}" for k in ("fc_max", "cad", "d+", "decouplage_pct", "ef", "intensite", "trimp", "temp_c", "rpe", "feel", "gap")
-                  if d.get(k) is not None]
+        extras = [f"{labels.get(k, k)}={_cell(d[k])}" for k in ("fc_max", "cad", "d+", "decouplage_pct", "ef", "intensite", "trimp", "temp_c",
+                                                              "rpe", "feel", "gap", "watts_moy", "watts_np", "foulee_m") if d.get(k) is not None]
         if d.get("temps_zones_fc_s"):
             extras.append("zones_fc_s=" + "/".join(str(x) for x in d["temps_zones_fc_s"]))
+        if d.get("pic_fc"):
+            extras.append(f"pic_fc={d['pic_fc']['fc']} à la {d['pic_fc']['min']}e min")
+        if d.get("chaussures"):
+            extras.append("chaussures=" + _cell(d["chaussures"]))
         if d.get("notes"):
             extras.append("notes=" + _cell(d["notes"]))
         part = [f"## {d.get('d')} {_cell(d.get('nom'))} " + " ".join(extras)]
+        if d.get("phases"):
+            part.append("phases (tiers de la séance, plage = 5e-95e centile)\n" + _table(d["phases"], PHASE_COLS, drop_empty=True))
+        if d.get("fc_cumul"):
+            part.append("part du temps sous une FC donnée : " + d["fc_cumul"])
+        if d.get("dyn"):
+            part.append("dynamique de course (moyenne [5e-95e centile], 1er tiers→dernier tiers, dérive) : " + " | ".join(
+                f"{k} {v['moy']} [{v['p5']}-{v['p95']}] {v['t1']}→{v['t3']} ({v['derive_pct']:+.1f} %)" for k, v in d["dyn"].items()))
         if d.get("laps"):
-            part.append("laps\n" + _table(d["laps"], LAP_COLS))
+            part.append("laps\n" + _table(d["laps"], LAP_COLS, drop_empty=True))
         if d.get("km"):
             km_rows = [dict(r, km=(f"{r['km']}p" if r.get("partiel") else r["km"])) for r in d["km"]]
-            part.append("km\n" + _table(km_rows, KM_COLS))
+            part.append("km\n" + _table(km_rows, KM_COLS, drop_empty=True))
         out.append("\n".join(part))
     return "\n".join(out)
 
@@ -1910,9 +2151,9 @@ def make_prompt(prof, weather, well, acts, evts, user_msg, series="auto"):
     )
     series_block = build_series_block(acts, user_msg, series)
     daily, weekly = split_wellness(well)
-    hist = "\n".join(f"{h['role']}: {h['text']}" for h in get_chat_history(4)) or "(vide)"
+    hist = "\n".join(f"{'athlète' if h['role'] == 'athlete' else 'coach'}: {h['text']}" for h in get_chat_history(6)) or "(vide)"
     parts = [
-        _block("PROFIL ATHLÈTE", prof),
+        _block("PROFIL ATHLÈTE", dict(prof or {}, **({"prenom": ATHLETE_NAME} if ATHLETE_NAME else {}))),
         _block("MÉMOIRE DURABLE", get_notes()),
         _tblock("SANTÉ, un jour par ligne, du plus récent au plus ancien (sommeil_h, hrv, hrv_base = référence HRV, fc_repos, tsb, atl, ctl)", daily, WELL_COLS),
     ]
@@ -1939,7 +2180,7 @@ def make_prompt(prof, weather, well, acts, evts, user_msg, series="auto"):
     ]
     if series_block:
         parts += ["", series_block]
-    parts += ["", f'MESSAGE DE L\'ATHLÈTE :\n"{user_msg}"']
+    parts += ["", f"MODE DE RÉPONSE : {detect_mode(user_msg)}", f'MESSAGE DE L\'ATHLÈTE :\n"{user_msg}"']
     return "\n".join(parts)
 
 
@@ -2010,14 +2251,15 @@ def tg_send(chat_id, text):
 
 
 def finalize_reply(text: str, save: bool = True) -> str:
-    """Extrait la ligne [MEMOIRE], l'enregistre, et sauvegarde la réponse dans l'historique."""
+    """Extrait les lignes [MEMOIRE] (plusieurs possibles), les enregistre, et sauvegarde la réponse dans l'historique."""
     text = text or ""
-    if "[MEMOIRE]" in text:
-        head, _, tail = text.partition("[MEMOIRE]")
-        note = tail.strip().split("\n")[0].strip()
-        if note:
-            save_note(note)
-        text = head.strip()
+    notes = [n.strip() for n in re.findall(r"\[MEMOIRE\]\s*([^\n]+)", text) if n.strip()]
+    if notes:
+        known = {r[0] for r in db_exec("SELECT txt FROM notes", fetch=True) or []}
+        for n in notes[:4]:
+            if n[:500] not in known:
+                save_note(n)
+        text = re.sub(r"[ \t]*\[MEMOIRE\][^\n]*\n?", "", text).strip()
     if save and text:
         save_chat_msg("coach", text)
     return text
@@ -2034,19 +2276,38 @@ def _authorized(update: Update) -> bool:
 
 
 def think_level(msg, prompt):
-    """Réflexion Gemini : élevée pour analyser une séance avec son CSV, basse pour gérer le calendrier."""
-    if "SÉRIE DÉTAILLÉE (CSV" in prompt:
+    """Réflexion Gemini selon le mode : élevée pour analyser/bilan, basse pour gérer le calendrier."""
+    mode = detect_mode(msg)
+    if mode in ("ANALYSE", "BILAN") or "SÉRIE DÉTAILLÉE (CSV" in prompt:
         return THINKING_DEEP
-    if _PLANIF.search(msg or ""):
+    if mode == "PLANIFICATION":
         return THINKING_ROUTINE
     return THINKING_CHAT
+
+
+async def _typing_loop(bot, cid, action):
+    """Garde l'indicateur « en train d'écrire » actif pendant toute la génération (Telegram l'efface après 5 s)."""
+    try:
+        while True:
+            await bot.send_chat_action(chat_id=cid, action=action)
+            await asyncio.sleep(4)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        pass
+
+
+async def _stop_typing(task):
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError, Exception):
+        await task
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _authorized(update) or not update.message or not update.message.text:
         return
     cid = update.effective_chat.id
-    await context.bot.send_chat_action(chat_id=cid, action=ChatAction.TYPING)
+    typing = asyncio.create_task(_typing_loop(context.bot, cid, ChatAction.TYPING))
     msg = update.message.text
     save = True
     try:
@@ -2060,6 +2321,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         logging.exception("handle_text")
         ans, save = "⚠️ Erreur interne, réessaie dans un instant.", False
+    finally:
+        await _stop_typing(typing)
     await send_reply(cid, ans, save=save)
 
 
@@ -2070,7 +2333,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not v:
         return
     cid = update.effective_chat.id
-    await context.bot.send_chat_action(chat_id=cid, action=ChatAction.RECORD_VOICE)
+    typing = asyncio.create_task(_typing_loop(context.bot, cid, ChatAction.RECORD_VOICE))
     save = True
     try:
         f = await context.bot.get_file(v.file_id)
@@ -2091,6 +2354,8 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         logging.exception("handle_voice")
         ans, save = "⚠️ Erreur interne, réessaie dans un instant.", False
+    finally:
+        await _stop_typing(typing)
     await send_reply(cid, ans, save=save)
 
 
