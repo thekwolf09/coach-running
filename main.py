@@ -3,6 +3,7 @@ import os
 import io
 import re
 import json
+import hashlib
 import math
 import time
 import zlib
@@ -23,7 +24,7 @@ from google.genai import types
 from telegram import Update
 from telegram.constants import ChatAction
 from telegram.error import Conflict
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram.ext import ApplicationBuilder, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
@@ -42,6 +43,7 @@ DEFAULT_CITY = os.environ.get("DEFAULT_CITY", "Melbourne").strip()
 GOAL_DATE = datetime.date(2026, 12, 13)
 GOAL_TEXT = "5 km sub-20, cible 3'59/km"
 ATHLETE_NAME = os.environ.get("ATHLETE_NAME", "").strip()      # prénom utilisé par le coach (optionnel)
+COACH_TONE = os.environ.get("COACH_TONE", "").strip()          # ex. : "taquin et direct", "très encourageant", "sobre et factuel"
 
 BG_INTERVAL = 900               # secondes entre deux verifications automatiques
 MAX_DEBRIEFS_PER_CYCLE = 2      # limite d'appels Gemini automatiques par cycle
@@ -58,6 +60,7 @@ PRICE_IN = float(os.environ.get("PRICE_IN", "0.75"))          # $ par million de
 PRICE_CACHED = float(os.environ.get("PRICE_CACHED", "0.075"))
 PRICE_OUT = float(os.environ.get("PRICE_OUT", "3.75"))        # la réflexion est facturée comme de la sortie
 REMINDER_LEAD_MIN = int(os.environ.get("REMINDER_LEAD_MIN", "60"))   # rappel météo N minutes avant une séance
+EVE_HOUR = int(os.environ.get("EVE_HOUR", "20"))                    # message de la veille de séance (99 pour le désactiver)
 FOLLOWUP_HOUR = int(os.environ.get("FOLLOWUP_HOUR", "21"))          # relance si la séance du jour n'est pas détectée
 TRAIN_HOUR = int(os.environ.get("TRAIN_HOUR", "18"))                # heure par défaut si tes courses n'ont pas d'horaire habituel
 THINKING_ROUTINE = os.environ.get("THINKING_ROUTINE", "low").strip().lower()    # gestion du calendrier (planifier, décaler...)
@@ -86,6 +89,8 @@ JOURS_MAP = {
 RUN_TYPES = {"Run", "TrailRun", "VirtualRun"}
 KEEP_CATEGORIES = {"WORKOUT", "RACE_A", "RACE_B", "RACE_C", "SICK", "INJURY", "HOLIDAY"}
 ACWR_LIMIT = 1.35
+LOAD_LOW, LOAD_CAUTION, LOAD_HIGH = 0.8, 1.3, 1.5   # ratio de charge 7 j / 28 j : plage optimale 0,8 à 1,5
+ALLOWED_REACTIONS = {"👍", "❤", "🔥", "🥰", "👏", "😁", "🤔", "🎉", "🤩", "👌", "💯", "⚡", "🏆", "😎", "🤝", "🫡"}
 
 
 class AIError(Exception):
@@ -121,6 +126,7 @@ def init_db():
     db_exec("CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT)")
     db_exec("CREATE TABLE IF NOT EXISTS act_details (id TEXT PRIMARY KEY, v INTEGER, payload TEXT)")
     db_exec("CREATE TABLE IF NOT EXISTS act_streams (id TEXT PRIMARY KEY, v INTEGER, blob BLOB)")
+    db_exec("CREATE TABLE IF NOT EXISTS followups (id INTEGER PRIMARY KEY AUTOINCREMENT, due TEXT, txt TEXT, done INTEGER DEFAULT 0, created TEXT)")
     db_exec("CREATE TABLE IF NOT EXISTS efforts (id TEXT PRIMARY KEY, d TEXT, nom TEXT, pace_s INTEGER, hr INTEGER, duree_s INTEGER)")
     try:   # conserve l'historique des meilleurs efforts avant de purger les anciens détails mis en cache
         for (payload,) in db_exec("SELECT payload FROM act_details", fetch=True) or []:
@@ -366,7 +372,7 @@ def fetch_wellness():
             res = []
             for j in raw:
                 s_sec = j.get("sleepSecs") or 0
-                if s_sec or j.get("hrv") or j.get("ctl"):
+                if s_sec or j.get("hrv") or j.get("ctl") or j.get("weight"):
                     res.append({
                         "d": j.get("id"),
                         "sleep_h": round(s_sec / 3600, 1) if s_sec else None,
@@ -376,6 +382,15 @@ def fetch_wellness():
                         "tsb": j.get("form"),
                         "atl": j.get("atl"),
                         "ctl": j.get("ctl"),
+                        "weight": j.get("weight"),
+                        "sleep_score": j.get("sleepScore"),
+                        "readiness": j.get("readiness"),
+                        "vo2max": j.get("vo2max"),
+                        "fatigue": j.get("fatigue"),
+                        "soreness": j.get("soreness"),
+                        "stress": j.get("stress"),
+                        "mood": j.get("mood"),
+                        "motivation": j.get("motivation"),
                     })
             return res
         logging.error(f"fetch_wellness : HTTP {r.status_code}")
@@ -438,13 +453,36 @@ def _daily_loads(acts, days):
     return [loads.get((today - datetime.timedelta(days=i)).isoformat(), 0) for i in range(days)]
 
 
+def _week_km(acts):
+    km = {}
+    for a in (acts or {}).get("brut_recent", []):
+        if a.get("type") in RUN_TYPES:
+            try:
+                ws = _monday(datetime.date.fromisoformat(a["d"]))
+            except Exception:
+                continue
+            km[ws] = km.get(ws, 0.0) + (a.get("km") or 0)
+    return km
+
+
+def _training_streak(acts):
+    today = datetime.date.today()
+    days = {a["d"] for a in (acts or {}).get("brut_recent", []) if (a.get("min") or 0) >= 15 or (a.get("km") or 0) >= 2}
+    k, n = (0 if today.isoformat() in days else 1), 0
+    while (today - datetime.timedelta(days=k + n)).isoformat() in days:
+        n += 1
+    return n
+
+
 def evaluate_injury_risk(well, acts=None):
-    """Risque de surcharge à partir de plusieurs signaux (un ratio ACWR seul est trop instable après une coupure).
-    DANGER : 2 signaux de charge, ou 1 signal de charge + 1 signal physiologique. VIGILANCE : 1 signal isolé."""
+    """Risque de surcharge. Référence : le ratio de charge 7 j / 28 j (plage optimale 0,8 à 1,5). Le ratio ATL/CTL est gonflé après une coupure : il ne sert qu'en dernier recours.
+    DANGER : ratio au-dessus de la plage ET une confirmation (volume, jours consécutifs, signal physiologique), ratio >= 1,8,
+    ou ratio haut + 2 signaux physiologiques. VIGILANCE : ratio en haut de plage ou un signal isolé."""
     if not well:
-        return {"acwr": None, "acwr_glissant": None, "rampe_ctl_7j": None, "alerte_surcharge": False,
+        return {"acwr": None, "acwr_glissant": None, "rampe_ctl_7j": None, "ratio_charge": None, "alerte_surcharge": False,
                 "alerte_vrc": False, "statut": "INCONNU", "details": ["Données de santé indisponibles"]}
 
+    today = datetime.date.today()
     ref = next((w for w in well if (w.get("atl") or 0) > 0 and (w.get("ctl") or 0) > 0), None)
     acwr = round(ref["atl"] / ref["ctl"], 2) if ref else None
     ramp = None
@@ -452,6 +490,8 @@ def evaluate_injury_risk(well, acts=None):
         old = _entry_near(well, (_age_days(ref.get("d")) or 0) + 7)
         if old is not None:
             ramp = round(ref["ctl"] - old["ctl"], 1)
+    ctl_max = max((w.get("ctl") or 0 for w in well), default=0)
+    reprise = bool(ref and ctl_max > 0 and ref["ctl"] < 0.75 * ctl_max)
 
     rolling = None
     if acts and acts.get("brut_recent"):
@@ -460,19 +500,36 @@ def evaluate_injury_risk(well, acts=None):
         if chronic_week > 0:
             rolling = round(sum(loads[:7]) / chronic_week, 2)
 
+    if rolling is not None:
+        ratio, source = rolling, "Intervals 7 j / 28 j"
+    elif acwr is not None and not reprise:
+        ratio, source = acwr, "ATL/CTL"
+    else:
+        ratio, source = None, None
+
     pts = [w for w in well if w.get("hrv") and w.get("hrv_base")][:2]
     alerte_vrc = len(pts) == 2 and all(w["hrv"] < w["hrv_base"] * 0.90 for w in pts)
     rhr_recent, rhr_base = _avg(_vals(well, "rhr", 0, 2)), _avg(_vals(well, "rhr", 7, 34))
     rhr_delta = round(rhr_recent - rhr_base, 1) if rhr_recent and rhr_base else None
     sleep7 = _avg(_vals(well, "sleep_h", 0, 6))
 
-    charge, physio = [], []
-    if acwr is not None and acwr >= ACWR_LIMIT:
-        charge.append(f"ACWR {acwr} (seuil {ACWR_LIMIT})")
-    if rolling is not None and rolling >= ROLLING_ACWR_LIMIT:
-        charge.append(f"ACWR glissant {rolling} (seuil {ROLLING_ACWR_LIMIT})")
-    if ramp is not None and ramp >= RAMP_LIMIT:
-        charge.append(f"CTL +{ramp} en 7 jours (seuil +{RAMP_LIMIT:g})")
+    charge, confirm, physio, level = [], [], [], 0
+    if ratio is not None:
+        if ratio >= LOAD_HIGH:
+            level = 2
+            charge.append(f"ratio de charge {ratio:g} ({source}) au-dessus de la plage optimale ({LOAD_LOW:g} à {LOAD_HIGH:g})")
+        elif ratio >= LOAD_CAUTION:
+            level = 1
+            charge.append(f"ratio de charge {ratio:g} ({source}) en haut de la plage optimale ({LOAD_LOW:g} à {LOAD_HIGH:g})")
+    km = _week_km(acts)
+    this = _monday(today)
+    last = km.get(this - datetime.timedelta(days=7), 0.0)
+    prev = [km.get(this - datetime.timedelta(days=7 * k), 0.0) for k in (2, 3, 4)]
+    if sum(prev) > 0 and last >= 10 and last / (sum(prev) / 3) - 1 > 0.30:
+        confirm.append(f"volume {(last / (sum(prev) / 3) - 1) * 100:+.0f} % la semaine dernière par rapport aux 3 précédentes")
+    streak = _training_streak(acts)
+    if streak >= 6:
+        confirm.append(f"{streak} jours d'activité consécutifs")
     if alerte_vrc:
         physio.append("VRC sous 90 % de la référence sur les deux dernières mesures")
     if rhr_delta is not None and rhr_delta >= 5:
@@ -480,17 +537,17 @@ def evaluate_injury_risk(well, acts=None):
     if sleep7 is not None and sleep7 < 6.0:
         physio.append(f"sommeil moyen {sleep7:.1f} h sur 7 jours")
 
-    if len(charge) >= 2 or (charge and physio):
+    if (level >= 2 and (confirm or physio)) or (ratio is not None and ratio >= 1.8) or (level >= 1 and len(physio) >= 2):
         statut = "DANGER"
-    elif charge or physio:
+    elif level >= 1 or physio:
         statut = "VIGILANCE"
-    elif acwr is None and len(pts) < 2:
+    elif ratio is None and len(pts) < 2:
         statut = "INCONNU"
     else:
         statut = "OPTIMAL"
-    return {"acwr": acwr, "acwr_glissant": rolling, "rampe_ctl_7j": ramp,
-            "alerte_surcharge": acwr is not None and acwr >= ACWR_LIMIT, "alerte_vrc": alerte_vrc,
-            "statut": statut, "signaux_charge": charge, "signaux_physio": physio, "details": charge + physio}
+    return {"acwr": acwr, "acwr_glissant": rolling, "rampe_ctl_7j": ramp, "ratio_charge": ratio, "ratio_source": source,
+            "reprise": reprise, "alerte_surcharge": level >= 1, "alerte_vrc": alerte_vrc, "statut": statut,
+            "signaux_charge": charge + confirm, "signaux_physio": physio, "details": charge + confirm + physio}
 
 
 # ---- Tableau de bord : indicateurs calculés par le code (un LLM calcule mal des moyennes sur 90 lignes)
@@ -536,28 +593,112 @@ def _dash_recup(c):
 
 def _dash_charge(c):
     well, acts, risk = c["well"], c["acts"], c["risk"]
-    ref = next((w for w in well if (w.get("atl") or 0) > 0 and (w.get("ctl") or 0) > 0), None)
-    if not ref:
-        return None
-    age = _age_days(ref.get("d")) or 0
-    c7, c28 = _entry_near(well, age + 7), _entry_near(well, age + 28, max_gap=4)
-    bits = []
-    if c7:
-        bits.append(f"{ref['ctl'] - c7['ctl']:+.1f} en 7 j")
-    if c28:
-        bits.append(f"{(ref['ctl'] - c28['ctl']) / 4:+.1f}/sem sur 28 j")
-    t = f"CTL {_cell(ref['ctl'])}" + (f" ({', '.join(bits)})" if bits else "")
-    t += f" | ATL {_cell(ref['atl'])} | TSB {_cell(ref.get('tsb'))} | ACWR {risk.get('acwr')}"
+    parts = []
     loads = _daily_loads(acts, 28)
     if sum(loads) > 0:
         acute, chronic = sum(loads[:7]), sum(loads) / 4
-        t += f" | charge 7 j {acute:.0f} vs moyenne hebdo 28 j {chronic:.0f} (glissant {acute / chronic:.2f})"
+        ratio = acute / chronic
+        tag = "optimale" if LOAD_LOW <= ratio <= LOAD_HIGH else ("haute" if ratio > LOAD_HIGH else "basse")
+        t = (f"RATIO DE CHARGE 7 j / 28 j {ratio:.2f} ({tag} : plage optimale {LOAD_LOW:g} à {LOAD_HIGH:g} ; "
+             f"charge 7 j {acute:.0f} vs moyenne hebdo 28 j {chronic:.0f})")
         l7 = loads[:7]
         sd = _std(l7)
         if sd:
             mono = (sum(l7) / 7) / sd
-            t += f" | monotonie {mono:.1f}, tension {acute * mono:.0f}"
-    return "CHARGE : " + t
+            t += f" ; monotonie {mono:.1f}, tension {acute * mono:.0f}"
+        parts.append(t)
+    ref = next((w for w in well if (w.get("atl") or 0) > 0 and (w.get("ctl") or 0) > 0), None)
+    if ref:
+        age = _age_days(ref.get("d")) or 0
+        c7, c28 = _entry_near(well, age + 7), _entry_near(well, age + 28, max_gap=4)
+        bits = []
+        if c7:
+            bits.append(f"{ref['ctl'] - c7['ctl']:+.1f} en 7 j")
+        if c28:
+            bits.append(f"{(ref['ctl'] - c28['ctl']) / 4:+.1f}/sem sur 28 j")
+        t = (f"ATL/CTL Intervals : CTL {_cell(ref['ctl'])}" + (f" ({', '.join(bits)})" if bits else "")
+             + f", ATL {_cell(ref['atl'])}, TSB {_cell(ref.get('tsb'))}, ratio ATL/CTL {risk.get('acwr')}")
+        if risk.get("reprise"):
+            ctl_max = max((w.get("ctl") or 0 for w in well), default=0)
+            t += f" → peu fiable en reprise (CTL {ref['ctl']:.0f} pour un pic de {ctl_max:.0f} sur 90 j) : ne pas s'en servir pour alerter"
+        parts.append(t)
+    return "CHARGE : " + " | ".join(parts) if parts else None
+
+
+
+def _easy_weeks(c):
+    lthr = (c["prof"] or {}).get("lthr")
+    if not lthr:
+        return []
+    thr, weeks = round(lthr * 0.85), {}
+    for a in c["recent"]:
+        if a.get("type") in RUN_TYPES and a.get("hr") and a["hr"] <= thr and (a.get("km") or 0) >= 4 and (a.get("min") or 0) > 0:
+            ws = _monday(datetime.date.fromisoformat(a["d"]))
+            w = weeks.setdefault(ws, {"sec": 0.0, "km": 0.0, "hr_w": 0.0})
+            w["sec"] += a["min"] * 60
+            w["km"] += a["km"]
+            w["hr_w"] += a["hr"] * a["min"]
+    return [(ws, w["sec"] / w["km"], w["hr_w"] / (w["sec"] / 60)) for ws, w in sorted(weeks.items(), reverse=True)]
+
+
+def _dash_faits(c):
+    """Vraies réussites détectées par le code : de quoi féliciter précisément, sans rien inventer."""
+    today, recent, well = c["today"], c["recent"], c["well"]
+    runs = [a for a in recent if a.get("type") in RUN_TYPES and (a.get("km") or 0) >= 1]
+    out = []
+    try:
+        if len(runs) >= 8 and (_age_days(runs[0]["d"], today) or 99) <= 2:
+            longest = max(runs, key=lambda a: a["km"])
+            if longest["id"] == runs[0]["id"] and longest["km"] >= 8:
+                out.append(f"plus longue sortie des {RAW_DAYS} derniers jours : {longest['km']:.1f} km")
+    except Exception:
+        pass
+    try:
+        km = _week_km(c["acts"])
+        last = _monday(today) - datetime.timedelta(days=7)
+        hist = [v for k, v in km.items() if k < _monday(today) and k >= _monday(today) - datetime.timedelta(days=7 * 12)]
+        if len(hist) >= 4 and km.get(last, 0) >= max(hist) and km.get(last, 0) >= 15:
+            out.append(f"semaine du {last.isoformat()} : record de volume sur 12 semaines ({km[last]:.1f} km)")
+        weeks_ok = 0
+        for k in range(1, 9):
+            ws = _monday(today) - datetime.timedelta(days=7 * k)
+            if sum(1 for a in runs if _monday(datetime.date.fromisoformat(a["d"])) == ws) >= 3:
+                weeks_ok += 1
+            else:
+                break
+        if weeks_ok >= 3:
+            out.append(f"{weeks_ok} semaines d'affilée avec au moins 3 courses")
+    except Exception:
+        pass
+    try:
+        ew = _easy_weeks(c)
+        if len(ew) >= 3 and ew[0][1] < min(x[1] for x in ew[1:]) - 4:
+            out.append(f"allure facile record à FC basse : {_mmss(ew[0][1])} @ {ew[0][2]:.0f} bpm (précédent meilleur {_mmss(min(x[1] for x in ew[1:]))})")
+    except Exception:
+        pass
+    try:
+        hist = effort_history(c["details"])
+        if len(hist) >= 3 and hist[-1]["pace_s"] < min(h["pace_s"] for h in hist[:-1]) and (_age_days(hist[-1]["d"], today) or 99) <= 3:
+            out.append(f"meilleur effort structuré jamais enregistré : {_mmss(hist[-1]['pace_s'])}/km (précédent {_mmss(min(h['pace_s'] for h in hist[:-1]))})")
+    except Exception:
+        pass
+    try:
+        hrv = _vals(well, "hrv", 0, 27)
+        if len(hrv) >= 10 and hrv[0] >= max(hrv) and (_age_days(next((w["d"] for w in well if w.get("hrv")), None), today) or 99) <= 2:
+            out.append(f"HRV au plus haut depuis 4 semaines ({hrv[0]:.0f})")
+        rhr = _vals(well, "rhr", 0, 27)
+        if len(rhr) >= 10 and min(rhr[:3]) <= min(rhr[3:]) - 1:
+            out.append(f"FC de repos au plus bas depuis 4 semaines ({min(rhr[:3]):.0f})")
+    except Exception:
+        pass
+    try:
+        for g in (c["prof"] or {}).get("materiel") or []:
+            mt = re.search(r"^(.*?) \(.*\) : (\d+) km", g)
+            if mt and int(mt.group(2)) >= 600:
+                out.append(f"{mt.group(1)} : {mt.group(2)} km, zone de renouvellement à partir de 700-800 km")
+    except Exception:
+        pass
+    return ("FAITS MARQUANTS (détectés par le code : félicite uniquement ce qui est réel) : " + " | ".join(out[:4])) if out else None
 
 
 def _dash_semaines(c):
@@ -727,6 +868,18 @@ def _dash_decouplage(c):
             + " | ".join(f"{d['d']} {_cell(d['decouplage_pct'])} % ({_cell(d.get('nom'))})" for d in rows))
 
 
+def plan_phase(days_left):
+    """Phase d'une préparation 5 km selon le temps restant : le coach situe chaque conseil dans le plan."""
+    w = days_left / 7
+    if w > 8:
+        return "construction aérobie (volume, endurance, un peu de seuil)"
+    if w > 4:
+        return "développement spécifique (seuil, VMA, allure 5 km)"
+    if w > 1.5:
+        return "affûtage (on garde l'intensité, on réduit le volume)"
+    return "semaine de course (fraîcheur avant tout)"
+
+
 def _dash_objectif(c):
     today = c["today"]
     days_left = (GOAL_DATE - today).days
@@ -734,7 +887,8 @@ def _dash_objectif(c):
         return None
     mt = re.search(r"(\d+)'(\d{2})", GOAL_TEXT)
     goal_pace = int(mt.group(1)) * 60 + int(mt.group(2)) if mt else None
-    parts = [f"{GOAL_TEXT} le {GOAL_DATE.strftime('%d/%m/%Y')} : J-{days_left}, soit {days_left / 7:.1f} semaines"]
+    parts = [f"{GOAL_TEXT} le {GOAL_DATE.strftime('%d/%m/%Y')} : J-{days_left}, soit {days_left / 7:.1f} semaines",
+             f"phase actuelle : {plan_phase(days_left)}"]
     hist = effort_history(c["details"])
     est = None
     recent_pts = [h for h in hist if (_age_days(h["d"]) if _age_days(h["d"]) is not None else 999) <= 56]
@@ -771,9 +925,10 @@ def _dash_enveloppe(c):
         return None
     coef = 0.7 if risk.get("statut") == "DANGER" else 1.0
     chronic, acute = sum(loads) / 4, sum(loads[:7])
-    max_load = round(chronic * ROLLING_ACWR_LIMIT * coef)
-    parts = [f"charge sur 7 jours glissants : max ≈ {max_load} (1,3 × moyenne hebdo 28 j de {chronic:.0f}"
-             f"{', réduit de 30 % car alerte' if coef < 1 else ''}), cumulée {acute:.0f}, marge {max_load - round(acute):+d}"]
+    max_load = round(chronic * LOAD_CAUTION * coef)
+    parts = [f"charge sur 7 jours glissants : cible ≤ {max_load} (1,3 × moyenne hebdo 28 j de {chronic:.0f}"
+             f"{', réduit de 30 % car risque élevé' if coef < 1 else ''}), cumulée {acute:.0f}, marge {max_load - round(acute):+d} ; "
+             f"plafond de la plage optimale (1,5) : {round(chronic * LOAD_HIGH)}"]
     this = _monday(today)
     km = {}
     for a in recent:
@@ -787,10 +942,61 @@ def _dash_enveloppe(c):
                      f"faits {done:.1f}, reste {max(0.0, max_km - done):.1f}")
         parts.append(f"sortie longue max ≈ {max_km / 3:.1f} km (un tiers du volume)")
     ramp = risk.get("rampe_ctl_7j")
-    if ramp is not None:
+    if ramp is not None and not risk.get("reprise"):
         parts.append(f"rampe CTL sur 7 jours {ramp:+.1f} (limite +{RAMP_LIMIT:g}), marge {RAMP_LIMIT - ramp:+.1f}")
     parts.append("jamais deux séances intenses à moins de 48 h")
     return "ENVELOPPE DE CHARGE POUR PLANIFIER (garde-fous du code) : " + " | ".join(parts)
+
+
+def _dash_prepa(c):
+    """Semaine du plan en cours (noms « S3 E2 » du calendrier) : le coach situe l'athlète dans la préparation."""
+    today = c["today"]
+    nums, cur = [], {}
+    for e in c["evts"]:
+        mt = re.match(r"\s*S(\d{1,2})\s*E\d+", str(e.get("nom") or ""), re.I)
+        if not mt or e.get("category") not in (None, "WORKOUT"):
+            continue
+        n = int(mt.group(1))
+        nums.append(n)
+        try:
+            ws = _monday(datetime.date.fromisoformat(e["d"]))
+        except Exception:
+            continue
+        cur.setdefault(ws, []).append(n)
+    here = cur.get(_monday(today))
+    if not here or not nums:
+        return None
+    wk = max(set(here), key=here.count)
+    days_left = (GOAL_DATE - today).days
+    return (f"PRÉPA : semaine S{wk} en cours, plan programmé jusqu'à S{max(nums)} ; objectif dans {days_left // 7} semaines et {days_left % 7} jours"
+            + (f", phase actuelle : {plan_phase(days_left)}" if days_left >= 0 else ""))
+
+
+def _dash_poids(c):
+    """Tendance du poids (moyennes, jamais une pesée isolée) et puissance rapportée au poids."""
+    well = c["well"]
+    w7, w28, old = _avg(_vals(well, "weight", 0, 6)), _avg(_vals(well, "weight", 0, 27)), _avg(_vals(well, "weight", 21, 35))
+    last = next((w for w in well if isinstance(w.get("weight"), (int, float)) and w["weight"] > 0), None)
+    kg = w7 or (last["weight"] if last else None) or (c["prof"] or {}).get("weight")
+    if not kg:
+        return None
+    if w7 is None and last is None:
+        t = f"POIDS : {_cell(kg)} kg (réglage du profil Intervals, aucune pesée récente)"
+    else:
+        t = f"POIDS : moyenne 7 j {kg:.1f} kg"
+        if w28:
+            t += f", moyenne 28 j {w28:.1f} kg"
+        if old:
+            d = (w7 or kg) - old
+            t += f", {d:+.1f} kg par rapport à il y a 4 semaines" + (" (variation notable : à relier à l'alimentation et à la charge, sans conclure)" if abs(d) >= 2 else "")
+        if last:
+            t += f" ; dernière pesée {_cell(last['weight'])} kg le {last.get('d')}"
+    for d in c["details"]:
+        watts = ((d.get("bio") or {}).get("watts") or {}).get("moy") or d.get("watts_moy")
+        if watts:
+            t += f" | puissance moyenne du dernier footing détaillé {watts:.0f} W, soit {watts / kg:.2f} W/kg"
+            break
+    return t
 
 
 def dashboard_lines(prof, well, acts, evts, risk=None):
@@ -798,7 +1004,7 @@ def dashboard_lines(prof, well, acts, evts, risk=None):
            "recent": (acts or {}).get("brut_recent", []), "details": (acts or {}).get("detail_dernieres_courses") or [],
            "risk": risk or evaluate_injury_risk(well, acts)}
     out = []
-    for fn in (_dash_recup, _dash_charge, _dash_semaines, _dash_semaine_plan, _dash_rythme, _dash_allure_facile, _dash_decouplage, _dash_zones,
+    for fn in (_dash_recup, _dash_poids, _dash_charge, _dash_faits, _dash_semaines, _dash_semaine_plan, _dash_prepa, _dash_rythme, _dash_allure_facile, _dash_decouplage, _dash_zones,
                _dash_adherence, _dash_objectif, _dash_enveloppe):
         try:
             line = fn(ctx)
@@ -939,7 +1145,7 @@ def split_wellness(well, days_full=None):
             vals = [x[field] for x in rows if isinstance(x.get(field), (int, float))]
             return round(sum(vals) / len(vals), nd) if vals else None
         weekly.append({"d": k, "sleep_h": avg("sleep_h"), "hrv": avg("hrv"), "rhr": avg("rhr"),
-                       "tsb": avg("tsb"), "atl": avg("atl"), "ctl": avg("ctl")})
+                       "tsb": avg("tsb"), "atl": avg("atl"), "ctl": avg("ctl"), "weight": avg("weight")})
     return daily, weekly
 
 
@@ -1437,8 +1643,10 @@ def detect_mode(msg):
         return "BRIEF"
     if low.startswith("c'est dimanche soir"):
         return "BILAN"
-    if low.startswith("message vocal"):
+    if low.startswith("message vocal") or low.startswith("photo de l'athlète"):
         return "LIBRE"
+    if low.startswith("suivi à faire"):
+        return "SUIVI"
     if _BRIEF_RE.search(low):
         return "BRIEF"
     if _BILAN_RE.search(low):
@@ -1843,7 +2051,7 @@ TOOLS_MAP = {f.__name__: f for f in TOOLS}
 # --------------------------------------------------------------------------
 # GEMINI
 # --------------------------------------------------------------------------
-SYSTEM_INSTRUCTION = """Tu es le coach personnel de course à pied de cet athlète, pas un tableau de bord. Tu as l'oeil d'un expert (physiologie de l'endurance, gestion de la charge, biomécanique) et la chaleur d'un coach qui connaît son athlète depuis des mois. Tu le tutoies et, si le champ prenom du PROFIL existe, tu l'appelles par son prénom de temps en temps. Tu écris un français naturel et vivant : phrases variées, humour léger quand il s'y prête, 0 à 2 émojis au maximum.
+SYSTEM_INSTRUCTION = """Tu es le coach personnel de course à pied de cet athlète, pas un tableau de bord. Tu as l'oeil d'un expert (physiologie de l'endurance, gestion de la charge, biomécanique) et la chaleur d'un coach qui connaît son athlète depuis des mois. Tu le tutoies et, si le champ prenom du PROFIL existe, tu l'appelles par son prénom de temps en temps. Tu écris un français naturel et vivant : phrases variées, humour léger quand il s'y prête, 0 à 2 émojis au maximum. Si un bloc TON DU COACH est fourni, adopte ce ton.
 
 PERSONNALITÉ
 - Tu écoutes d'abord. Quand l'athlète te raconte quelque chose (sensation, fierté, doute, matériel, anecdote, taquinerie), tu réagis à ce qu'il dit, avec ses mots, avant tout chiffre, et tu relèves ce qu'il y a derrière.
@@ -1853,16 +2061,22 @@ PERSONNALITÉ
 
 RÈGLES
 1. Données : les listes sont triées du plus récent au plus ancien ; la première ligne de santé peut être incomplète (nuit du jour pas encore synchronisée). Le TABLEAU DE BORD est calculé par le code : cite ses chiffres, ne les recalcule pas. Appuie chaque conseil sur les données de l'athlète (allures et FC réellement observées, laps, phases, tendances). N'invente jamais une allure ou une FC cible : justifie-la par ses propres données. cad_spm est en pas par minute. Unités de la dynamique de course : stance_time (temps de contact au sol) en ms, vertical_oscillation en mm (divise par 10 pour des cm), step_length en mm (divise par 1000 pour des m), vertical_ratio en %, watts en W ; présente-les dans ces unités lisibles.
-2. Alerte surcharge : suis la consigne du bloc SURVEILLANCE. Une alerte déjà communiquée n'est JAMAIS répétée, ni en cours de message ni en conclusion. Le ratio ATL/CTL est gonflé après une coupure (CTL bas) : juge la charge sur la rampe de CTL, la progression hebdomadaire, la charge glissante et les signaux physiologiques, pas sur un seul ratio. Si les signaux se contredisent, dis-le.
+2. Charge : la référence est le RATIO DE CHARGE (charge des 7 derniers jours / moyenne hebdomadaire des 28 derniers jours), plage optimale 0,8 à 1,5. Le ratio ATL/CTL d'Intervals est gonflé après une coupure (CTL bas) : ne t'en sers pas pour alerter. Suis la consigne du bloc SURVEILLANCE : n'emploie le mot « alerte » que pour un risque ÉLEVÉ confirmé par plusieurs signaux, ne le répète jamais le même jour, ne dramatise ni un signal isolé ni un ratio dans la plage. Si les signaux se contredisent, dis-le.
 3. Pour modifier le calendrier, appelle l'outil (planifier_seance, deplacer_seance, supprimer_seance, gerer_indisponibilite, restaurer_suppression). Ne dis JAMAIS qu'une séance est planifiée, déplacée ou supprimée sans avoir appelé l'outil. N'appelle aucun outil quand l'athlète demande seulement un conseil ou une analyse, ni dans les modes BRIEF, DEBRIEF et BILAN (messages automatiques).
 4. Donne toujours les dates aux outils au format AAAA-MM-JJ, en t'appuyant sur les repères de dates fournis.
 5. Format Telegram HTML : uniquement <b>, <i> et <code>, aucun Markdown (pas de #, pas de **), aucune autre balise. Pour les listes courtes, utilise des puces « • ».
-6. Mémoire : pour chaque fait durable (blessure, matériel et kilométrage, préférence, contrainte, façon dont l'athlète réagit à l'entraînement), ajoute en fin de message une ligne [MEMOIRE] fait à retenir. Plusieurs lignes possibles.
+5 ter. Poids : n'évoque que la tendance sur 7 à 28 jours, jamais une pesée isolée ni une fluctuation quotidienne ; reste factuel et neutre ; ne donne aucun conseil de régime ni d'objectif de poids sauf demande explicite de l'athlète ; relie-le seulement à la performance (W/kg, économie de course) ou à la récupération quand c'est pertinent.
+5 bis. Mise en page des messages longs (DEBRIEF, ANALYSE, BRIEF, BILAN) : jamais de pavé de texte. Chaque section a son titre en gras sur sa propre ligne (<b>1. Vue d'ensemble</b>), avec une ligne vide avant et après. Sous un titre, une puce « • » par idée avec un libellé en gras (• <b>Allure moyenne :</b> 6'30/km), et une ligne vide entre deux puces dès qu'elles dépassent une ligne. Termine chaque section par une phrase de lecture en italique <i>…</i> qui dit ce que les chiffres signifient. Paragraphes de 3 lignes maximum, une ligne vide entre les sections. 
+6. Suivis : quand tu t'engages à reprendre un sujet plus tard (douleur, matériel, décision, résultat à regarder), ajoute en fin de message une ligne [SUIVI AAAA-MM-JJ] ce qu'il faudra lui demander ou vérifier (2 maximum par message, dans 1 à 14 jours). Quand le bloc SUIVIS À FAIRE n'est pas vide, reviens dessus avec naturel, jamais comme une liste administrative.
+6 bis. Mémoire : pour chaque fait durable (blessure, matériel et kilométrage, préférence, contrainte, façon dont l'athlète réagit à l'entraînement), ajoute en fin de message une ligne [MEMOIRE] fait à retenir. Plusieurs lignes possibles.
 7. Tu n'es pas médecin : en cas de douleur persistante ou de symptôme inquiétant, recommande de consulter.
 8. Si un bloc SÉRIE DÉTAILLÉE est fourni, c'est le CSV de la séance : exploite-le point par point (la colonne lap renvoie aux laps du bloc DÉTAIL). Si une analyse demande ce niveau de finesse et qu'il n'est pas fourni, invite l'athlète à écrire « analyse détaillée de [la séance ou la date] » (ajouter « csv complet » pour la seconde par seconde).
 9. Planification : avant de planifier ou de valider une séance ou un volume, vérifie l'ENVELOPPE DE CHARGE. Si la demande la dépasse, dis-le avec les chiffres et propose une alternative qui rentre dans l'enveloppe. Si l'athlète insiste, planifie quand même en précisant le risque : c'est lui qui décide.
 10. Météo : l'heure locale est fournie. Pour « dans 1 h », « ce soir », « demain matin », utilise le tableau MÉTÉO HEURE PAR HEURE et les créneaux favorables ; réponds avec les chiffres de l'heure demandée (ressenti, pluie, vent) et un conseil concret (tenue, créneau).
 11. Si des données manquent ou se contredisent, dis-le et donne l'hypothèse la plus probable plutôt que d'affirmer. Chaque phrase doit servir : un fait, une décision, une émotion reconnue ou une question, jamais de remplissage.
+12. Faits marquants : si le bloc FAITS MARQUANTS en contient, célèbre-les avec le chiffre dans le DEBRIEF, le BRIEF ou la CONVERSATION quand c'est pertinent. N'en invente jamais.
+13. Suivi : si une note de la MÉMOIRE DURABLE datée des 7 derniers jours mentionne une gêne, une douleur ou une contrainte, prends-en des nouvelles dans le prochain BRIEF ou à la fin d'une conversation. Dans le BRIEF, reprends un élément de la veille (sensation, matériel, contrainte) pour montrer que tu suis.
+14. Réaction : tu peux réagir à son message par un émoji en ajoutant, seule sur une ligne, [REACTION] 🔥 (au choix : 👍 ❤ 🔥 👏 🎉 💯 ⚡ 🏆 😁 🤔 🤝). Seulement en CONVERSATION ou QUESTION, quand ça sonne juste (belle performance, taquinerie, bonne nouvelle), jamais à chaque message.
 
 MODES (la ligne MODE DE RÉPONSE du message indique lequel appliquer)
 - CONVERSATION : l'athlète partage quelque chose. Réagis d'abord à ce qu'il dit, comme un coach qui l'écoute ; réponds aux sous-entendus ; apporte UNE valeur de coach liée à ses propos (ce que cela révèle, un conseil précis sur le matériel, la récupération, la suite). 1 ou 2 chiffres au maximum, seulement s'ils éclairent ce qu'il dit. Aucun titre, aucune liste, aucun bilan de séance, aucun rappel des splits. 40 à 120 mots.
@@ -1876,8 +2090,9 @@ MODES (la ligne MODE DE RÉPONSE du message indique lequel appliquer)
   Pas de liste des splits km par km sauf anomalie. N'ouvre jamais par l'alerte de surcharge : si elle est active et pas encore donnée, une phrase dans la section 5. Termine par UNE question courte sur les sensations (jambes, souffle, douleurs), que les données ne disent pas. 300 à 450 mots. Pour une ANALYSE sur un point précis (« ai-je respecté les fractions ? »), réponds d'abord à ce point avec les chiffres lap par lap, puis le brief condensé.
 - BRIEF (matin) : commence par une phrase humaine sur ce qui compte le plus ce matin, puis (a) récupération chiffrée par rapport à ses références ; (b) charge et tendance ; (c) séance du jour : la garder ou l'adapter, avec une prescription précise (durée, allure ou plage de FC justifiée par ses données, météo du créneau si elle compte) ; (d) un seul point de vigilance ; (e) objectif : une seule ligne, uniquement le lundi ou si un indicateur a nettement bougé. 150 à 250 mots, intertitres courts en gras autorisés.
 - BILAN (hebdomadaire) : (a) volume réalisé par rapport à l'enveloppe, charge, fatigue, adhérence au plan ; (b) section OBJECTIF détaillée à partir de la ligne OBJECTIF du tableau de bord : estimation actuelle du 5 km, écart, progression nécessaire par semaine, tendance, verdict honnête sur la faisabilité (ni complaisant ni alarmiste) et ajustement du plan si besoin ; (c) les 3 séances clés de la semaine à venir, dans l'enveloppe de charge. 300 à 500 mots.
+- SUIVI (message automatique) : prends des nouvelles comme un coach qui n'a rien oublié : 1 à 3 phrases chaleureuses, une seule question, aucun chiffre sauf s'il aide.
 - PLANIFICATION : vérifie l'ENVELOPPE DE CHARGE, appelle l'outil, puis confirme en 1 à 3 phrases (ou explique ce qui dépasse l'enveloppe et propose une alternative).
-- LIBRE (message vocal) : déduis le mode du contenu de l'audio.
+- LIBRE (message vocal ou photo) : déduis le mode du contenu. Pour une photo (chaussures, repas, capture d'écran, paysage de sortie...), regarde l'image et réagis comme un coach qui la découvre, avec un conseil concret si elle s'y prête.
 
 EXEMPLES DE TON (à ne pas recopier)
 Athlète : « Super sortie, j'ai tenu mon cœur bas sans forcer, et mes vieilles chaussures (500 km) sont toujours aussi bonnes ! »
@@ -2055,14 +2270,16 @@ def _table(rows, cols, drop_empty=False):
     return "\n".join(lines)
 
 
-def _tblock(label, rows, cols):
+def _tblock(label, rows, cols, drop_empty=False):
     if not rows:
         return f"{label} : (indisponible ou vide)"
-    return f"{label} :\n{_table(rows, cols)}"
+    return f"{label} :\n{_table(rows, cols, drop_empty)}"
 
 
 WELL_COLS = [("d", "d"), ("sommeil_h", "sleep_h"), ("hrv", "hrv"), ("hrv_base", "hrv_base"), ("fc_repos", "rhr"),
-             ("tsb", "tsb"), ("atl", "atl"), ("ctl", "ctl")]
+             ("tsb", "tsb"), ("atl", "atl"), ("ctl", "ctl"), ("score_sommeil", "sleep_score"), ("readiness", "readiness"),
+             ("vo2max", "vo2max"), ("fatigue", "fatigue"), ("courbatures", "soreness"), ("stress", "stress"),
+             ("humeur", "mood"), ("motivation", "motivation"), ("poids_kg", "weight")]
 ACT_COLS = [("d", "d"), ("type", "type"), ("nom", "nom"), ("km", "km"), ("min", "min"), ("allure", "pace"),
             ("fc", "hr"), ("charge", "load")]
 WEEK_COLS = [("semaine", "semaine"), ("seances", "seances"), ("km", "km_total"), ("h", "temps_h"), ("charge", "charge_totale"),
@@ -2109,24 +2326,25 @@ def format_run_details(details):
     return "\n".join(out)
 
 
-_ALERT_WORDS = re.compile(r"acwr|danger|surcharge|blessure", re.I)
+_ALERT_WORDS = re.compile(r"acwr|danger|surcharge|blessure|risque|ratio de charge|alerte", re.I)
 
 
 def surveillance_info(well, acts=None):
-    """Risque + consigne : l'alerte est donnée une fois par jour, pas à chaque message."""
+    """Risque + consigne : un risque élevé n'est signalé qu'une fois par jour, un signal isolé n'est jamais dramatisé."""
     risk = evaluate_injury_risk(well, acts)
     if risk["statut"] == "DANGER":
         if kv_get("alert_ack") == f"{datetime.date.today().isoformat()}|DANGER":
-            risk["consigne"] = ("ALERTE DÉJÀ COMMUNIQUÉE AUJOURD'HUI : ne la répète pas, ne la rappelle pas, ne conclus pas par un rappel. "
+            risk["consigne"] = ("RISQUE ÉLEVÉ DÉJÀ SIGNALÉ AUJOURD'HUI : ne le répète pas, ne le rappelle pas, ne conclus pas par un rappel. "
                                 "N'y reviens que si l'athlète parle de douleur ou de fatigue, ou veut planifier ou intensifier une séance.")
         else:
-            risk["consigne"] = "PREMIÈRE ALERTE DU JOUR : signale-la en 2 phrases maximum en citant les signaux, puis réponds à la demande sans y revenir."
+            risk["consigne"] = ("RISQUE ÉLEVÉ, plusieurs signaux concordent (signaux_charge, signaux_physio) : PREMIÈRE FOIS AUJOURD'HUI, dis-le "
+                                "calmement en 2 phrases maximum avec les signaux, puis réponds à la demande sans y revenir.")
     elif risk["statut"] == "VIGILANCE":
-        risk["consigne"] = "VIGILANCE (pas une alerte) : n'en parle que si elle change ta recommandation, en une phrase, sans dramatiser."
+        risk["consigne"] = "VIGILANCE (pas une alerte) : n'en parle que si cela change ta recommandation, en une phrase, sans dramatiser."
     elif risk["statut"] == "INCONNU":
         risk["consigne"] = "Données insuffisantes : ne conclus pas que tout va bien."
     else:
-        risk["consigne"] = "Aucune alerte active : n'en invente pas."
+        risk["consigne"] = "Charge dans la plage optimale : aucune alerte, n'en invente pas."
     return risk
 
 
@@ -2155,7 +2373,8 @@ def make_prompt(prof, weather, well, acts, evts, user_msg, series="auto"):
     parts = [
         _block("PROFIL ATHLÈTE", dict(prof or {}, **({"prenom": ATHLETE_NAME} if ATHLETE_NAME else {}))),
         _block("MÉMOIRE DURABLE", get_notes()),
-        _tblock("SANTÉ, un jour par ligne, du plus récent au plus ancien (sommeil_h, hrv, hrv_base = référence HRV, fc_repos, tsb, atl, ctl)", daily, WELL_COLS),
+        (f"TON DU COACH (choisi par l'athlète) : {COACH_TONE}" if COACH_TONE else "TON DU COACH : naturel, chaleureux et direct"),
+        _tblock("SANTÉ, un jour par ligne, du plus récent au plus ancien (sommeil_h, hrv, hrv_base = référence HRV, fc_repos, tsb, atl, ctl ; score_sommeil, readiness, vo2max, fatigue, courbatures, stress, humeur, motivation = mesures de la montre et ressenti saisi par l'athlète, échelles d'Intervals, colonnes présentes seulement si renseignées)", daily, WELL_COLS, drop_empty=True),
     ]
     if weekly:
         parts.append(_tblock("SANTÉ, moyennes hebdomadaires plus anciennes", weekly, WELL_COLS))
@@ -2178,6 +2397,10 @@ def make_prompt(prof, weather, well, acts, evts, user_msg, series="auto"):
         _tblock("MÉTÉO HEURE PAR HEURE, 24 h, heure locale (pluie_pct = probabilité de pluie)", (weather or {}).get("horaire"), WEATHER_COLS),
         "HISTORIQUE RÉCENT DE CONVERSATION (du plus ancien au plus récent) :\n" + hist,
     ]
+    due = due_followups()
+    if due:
+        parts += ["", "SUIVIS À FAIRE (promis par le coach, dus aujourd'hui : glisse-les naturellement dans ton message, comme un coach qui n'a pas oublié) :\n"
+                  + "\n".join(f"• {f['txt']} (prévu le {f['due']})" for f in due)]
     if series_block:
         parts += ["", series_block]
     parts += ["", f"MODE DE RÉPONSE : {detect_mode(user_msg)}", f'MESSAGE DE L\'ATHLÈTE :\n"{user_msg}"']
@@ -2229,15 +2452,43 @@ def split_message(text: str, limit: int = 3800):
     return chunks
 
 
-def tg_send(chat_id, text):
-    """Envoi synchrone : HTML nettoyé, découpé à 4096 caractères, repli en texte brut."""
-    text = sanitize_html(text or "")
+_HEAD_RE = re.compile(r"^\s*(?:<b>\s*\d+[.)]\s+[^<\n]{2,90}</b>|\d+[.)]\s+<b>[^<\n]{2,90}</b>|<b>[^<\n]{3,80}</b>\s*:?)\s*$")
+
+
+def airy(text):
+    """Aère un message structuré (au moins 2 titres en gras) : ligne vide avant/après les titres, entre puces longues, après une liste."""
+    lines = text.split("\n")
+    if sum(1 for l in lines if _HEAD_RE.match(l)) < 2:
+        return text
+    out = []
+    for i, l in enumerate(lines):
+        head, bullet = bool(_HEAD_RE.match(l)), l.lstrip().startswith("•")
+        prev = out[-1] if out else ""
+        if out and prev.strip():
+            if head or (prev.lstrip().startswith("•") and not bullet and l.strip()):
+                out.append("")
+            elif bullet and prev.lstrip().startswith("•") and (len(prev) > 90 or len(l) > 90):
+                out.append("")
+        out.append(l)
+        if head and i + 1 < len(lines) and lines[i + 1].strip():
+            out.append("")
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(out)).strip()
+
+
+def tg_send(chat_id, text, buttons=None):
+    """Envoi synchrone : HTML nettoyé, découpé à 4096 caractères, repli en texte brut.
+    buttons : lignes de boutons [[(libellé, callback_data), ...], ...] affichées sous le dernier morceau."""
+    text = airy(sanitize_html(text or ""))
     if not text:
         return
-    for chunk in split_message(text):
+    markup = ({"inline_keyboard": [[{"text": lbl, "callback_data": data} for lbl, data in row] for row in buttons]}
+              if buttons else None)
+    chunks = split_message(text)
+    for i, chunk in enumerate(chunks):
+        extra = {"reply_markup": markup} if (markup and i == len(chunks) - 1) else {}
         try:
             r = requests.post(f"{TG_API}/sendMessage",
-                              json={"chat_id": chat_id, "text": chunk, "parse_mode": "HTML"}, timeout=15)
+                              json={"chat_id": chat_id, "text": chunk, "parse_mode": "HTML", **extra}, timeout=15)
             if r.status_code == 200:
                 continue
             logging.warning(f"Telegram a refusé le HTML ({r.status_code}) : {r.text[:200]}")
@@ -2245,14 +2496,66 @@ def tg_send(chat_id, text):
             logging.error(f"Erreur envoi Telegram : {err}")
         try:
             plain = html.unescape(re.sub(r"<[^>]+>", "", chunk))
-            requests.post(f"{TG_API}/sendMessage", json={"chat_id": chat_id, "text": plain}, timeout=15)
+            requests.post(f"{TG_API}/sendMessage", json={"chat_id": chat_id, "text": plain, **extra}, timeout=15)
         except Exception:
             logging.exception("Envoi Telegram en texte brut impossible")
 
 
+def extract_reaction(text):
+    """Sépare la ligne [REACTION] 🔥 du message ; retourne (texte, émoji autorisé ou None)."""
+    text = text or ""
+    mt = re.search(r"^[ \t]*\[REACTION\][ \t]*(\S+)[ \t]*$", text, re.M)
+    emoji = mt.group(1).replace("\ufe0f", "") if mt else None
+    clean = re.sub(r"[ \t]*\[REACTION\][^\n]*\n?", "", text).strip()
+    return clean, (emoji if emoji in ALLOWED_REACTIONS else None)
+
+
+def tg_react(chat_id, message_id, emoji):
+    try:
+        requests.post(f"{TG_API}/setMessageReaction",
+                      json={"chat_id": chat_id, "message_id": message_id, "reaction": [{"type": "emoji", "emoji": emoji}]}, timeout=8)
+    except Exception as err:
+        logging.warning(f"Réaction Telegram impossible : {err}")
+
+
+def add_followup(due, txt):
+    """Enregistre un suivi promis par le coach (« reprendre des nouvelles du mollet jeudi »). Date : demain au plus tôt, 30 jours au plus tard."""
+    txt = re.sub(r"\s+", " ", str(txt or "")).strip()[:200]
+    try:
+        d = datetime.date.fromisoformat(str(due))
+    except ValueError:
+        return False
+    today = datetime.date.today()
+    d = min(max(d, today + datetime.timedelta(days=1)), today + datetime.timedelta(days=30))
+    if not txt or db_exec("SELECT 1 FROM followups WHERE done=0 AND txt=?", (txt,), fetch=True):
+        return False
+    if db_exec("SELECT COUNT(*) FROM followups WHERE done=0", fetch=True)[0][0] >= 6:
+        return False
+    db_exec("INSERT INTO followups (due, txt, created) VALUES (?, ?, ?)", (d.isoformat(), txt, today.isoformat()))
+    return True
+
+
+def due_followups(today=None, limit=3):
+    iso = (today or datetime.date.today()).isoformat()
+    rows = db_exec("SELECT id, due, txt FROM followups WHERE done=0 AND due<=? ORDER BY due, id LIMIT ?", (iso, limit), fetch=True) or []
+    return [{"id": r[0], "due": r[1], "txt": r[2]} for r in rows]
+
+
+def ack_followups(reply_text, force=False):
+    """Un suivi est clos quand la réponse envoyée l'évoque (au moins un mot significatif du suivi) ; sinon il reste dû."""
+    try:
+        low = (reply_text or "").lower()
+        for f in due_followups():
+            words = [w for w in re.findall(r"[a-zà-ÿ]{5,}", f["txt"].lower())]
+            if force or any(w in low for w in words):
+                db_exec("UPDATE followups SET done=1 WHERE id=?", (f["id"],))
+    except Exception:
+        logging.exception("ack_followups")
+
+
 def finalize_reply(text: str, save: bool = True) -> str:
     """Extrait les lignes [MEMOIRE] (plusieurs possibles), les enregistre, et sauvegarde la réponse dans l'historique."""
-    text = text or ""
+    text = extract_reaction(text)[0]
     notes = [n.strip() for n in re.findall(r"\[MEMOIRE\]\s*([^\n]+)", text) if n.strip()]
     if notes:
         known = {r[0] for r in db_exec("SELECT txt FROM notes", fetch=True) or []}
@@ -2260,6 +2563,9 @@ def finalize_reply(text: str, save: bool = True) -> str:
             if n[:500] not in known:
                 save_note(n)
         text = re.sub(r"[ \t]*\[MEMOIRE\][^\n]*\n?", "", text).strip()
+    for due, what in re.findall(r"\[SUIVI\s+(\d{4}-\d{2}-\d{2})\]\s*([^\n]+)", text)[:2]:
+        add_followup(due, what)
+    text = re.sub(r"[ \t]*\[SUIVI[^\]]*\][^\n]*\n?", "", text).strip()
     if save and text:
         save_chat_msg("coach", text)
     return text
@@ -2309,13 +2615,15 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cid = update.effective_chat.id
     typing = asyncio.create_task(_typing_loop(context.bot, cid, ChatAction.TYPING))
     msg = update.message.text
-    save = True
+    save, emoji = True, None
     try:
         prof, weather, well, acts, evts = await asyncio.to_thread(get_all_data)
         prompt = await asyncio.to_thread(make_prompt, prof, weather, well, acts, evts, msg)
         save_chat_msg("athlete", msg)   # après make_prompt : le message courant n'est pas dans l'historique
         ans = await asyncio.to_thread(generate_ai, prompt, True, think_level(msg, prompt))
         ack_alert(well, ans, acts)
+        ack_followups(ans)
+        ans, emoji = extract_reaction(ans)
     except AIError as e:
         ans, save = str(e), False
     except Exception:
@@ -2323,6 +2631,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ans, save = "⚠️ Erreur interne, réessaie dans un instant.", False
     finally:
         await _stop_typing(typing)
+    if emoji:
+        await asyncio.to_thread(tg_react, cid, update.message.message_id, emoji)
     await send_reply(cid, ans, save=save)
 
 
@@ -2349,6 +2659,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         contents = [text_prompt, types.Part.from_bytes(data=buf.getvalue(), mime_type=mime)]
         ans = await asyncio.to_thread(generate_ai, contents)
         ack_alert(well, ans, acts)
+        ack_followups(ans)
     except AIError as e:
         ans, save = str(e), False
     except Exception:
@@ -2357,6 +2668,75 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     finally:
         await _stop_typing(typing)
     await send_reply(cid, ans, save=save)
+
+
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Photo (chaussures, repas, paysage, capture d'écran...) : le coach la regarde et réagit."""
+    if not _authorized(update) or not update.message or not update.message.photo:
+        return
+    cid = update.effective_chat.id
+    caption = (update.message.caption or "").strip()
+    typing = asyncio.create_task(_typing_loop(context.bot, cid, ChatAction.TYPING))
+    save, emoji = True, None
+    try:
+        f = await context.bot.get_file(update.message.photo[-1].file_id)
+        buf = io.BytesIO()
+        await f.download_to_memory(buf)
+        data = buf.getvalue()
+        prof, weather, well, acts, evts = await asyncio.to_thread(get_all_data)
+        msg = "Photo de l'athlète" + (f" (légende : {caption})" if caption else "") + " : regarde l'image et réponds en coach."
+        text_prompt = await asyncio.to_thread(make_prompt, prof, weather, well, acts, evts, msg, False)
+        save_chat_msg("athlete", "[Photo]" + (f" {caption}" if caption else ""))
+        ans = await asyncio.to_thread(generate_ai, [text_prompt, types.Part.from_bytes(data=data, mime_type="image/jpeg")])
+        ack_alert(well, ans, acts)
+        ack_followups(ans)
+        ans, emoji = extract_reaction(ans)
+    except AIError as e:
+        ans, save = str(e), False
+    except Exception:
+        logging.exception("handle_photo")
+        ans, save = "⚠️ Je n'arrive pas à lire cette image, réessaie dans un instant.", False
+    finally:
+        await _stop_typing(typing)
+    if emoji:
+        await asyncio.to_thread(tg_react, cid, update.message.message_id, emoji)
+    await send_reply(cid, ans, save=save)
+
+
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Boutons de la relance du soir : décaler à demain, annuler ou marquer comme faite, sans aucun appel Gemini."""
+    q = update.callback_query
+    if not q or not q.from_user or q.from_user.id != TG_USER:
+        return
+    try:
+        await q.answer()
+    except Exception:
+        pass
+    action, _, tok = str(q.data or "").partition("|")
+    raw = kv_get(f"cb|{tok}")
+    cid = q.message.chat_id if q.message else TG_USER
+    if not raw or action not in ("mv", "rm", "ok"):
+        await asyncio.to_thread(tg_send, cid, "⚠️ Ce bouton a expiré : écris-moi simplement ce que tu veux faire de la séance.")
+        return
+    info = json.loads(raw)
+    d, nom = info.get("d"), info.get("nom") or ""
+    try:
+        await q.edit_message_reply_markup(reply_markup=None)    # un seul appui : le clavier disparaît
+    except Exception:
+        pass
+    if action == "mv":
+        tomorrow = (datetime.date.fromisoformat(d) + datetime.timedelta(days=1)).isoformat()
+        res = await asyncio.to_thread(deplacer_seance, d, tomorrow, nom)
+        label = "Décaler à demain"
+    elif action == "rm":
+        res = await asyncio.to_thread(supprimer_seance, d, nom)
+        label = "Annuler"
+    else:
+        res = "✅ Noté. Dès que ta montre synchronise, je te fais le débrief."
+        label = "Déjà faite"
+    save_chat_msg("athlete", f"[Bouton] {label} ({nom})")
+    save_chat_msg("coach", "[Action] " + html.unescape(re.sub(r"<[^>]+>", "", res)))
+    await asyncio.to_thread(tg_send, cid, res)
 
 
 async def handle_cost(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2431,20 +2811,69 @@ def build_reminder(e, start, weather, mins):
     return "\n\n".join(lines)
 
 
+def followup_buttons(e, iso):
+    """Trois boutons sous la relance du soir ; l'action est retrouvée par un jeton court (callback_data limité à 64 octets)."""
+    tok = hashlib.md5(f"{iso}|{e.get('nom')}".encode("utf-8")).hexdigest()[:10]
+    kv_set(f"cb|{tok}", json.dumps({"d": iso, "nom": e.get("nom") or ""}, ensure_ascii=False))
+    return [[("📅 Décaler à demain", f"mv|{tok}"), ("❌ Annuler", f"rm|{tok}")], [("✅ Déjà faite", f"ok|{tok}")]]
+
+
 def build_followup(e):
     return (f"🕘 <b>Séance non détectée aujourd'hui : {_esc(e.get('nom') or 'Séance')}</b>\n\n"
-            "Si elle est faite, elle n'est peut-être pas encore synchronisée. Sinon écris « décale à demain » ou « annule » "
-            "et je mets le calendrier à jour.")
+            "Si elle est faite, elle n'est peut-être pas encore synchronisée. Sinon, un appui suffit pour que je mette "
+            "le calendrier à jour.")
 
 
-def _push_plain(text, tag):
+def _push_plain(text, tag, buttons=None):
     save_chat_msg("coach", f"[{tag}] " + html.unescape(re.sub(r"<[^>]+>", "", text)))
-    tg_send(TG_USER, text)
+    tg_send(TG_USER, text, buttons) if buttons else tg_send(TG_USER, text)
+
+
+def build_eve(e, start, weather):
+    nom = e.get("nom") or "Séance"
+    desc = (e.get("desc") or "").strip().replace("\n", " | ")
+    hard = bool(re.search(r"seuil|fraction|vma|\d+\s*x\s*\d|tempo|allure sp[ée]cifique", f"{nom} {desc}", re.I))
+    lines = [f"🌙 <b>Demain à {start:%H:%M} : {_esc(nom)}</b>"]
+    if desc:
+        lines.append(_esc(desc[:220]))
+    rows = weather_window(weather, start)
+    if rows:
+        r0 = rows[0]
+        meteo = f"🌦️ Prévu sur le créneau : {r0['temp_c']}°C (ressenti {r0['ress_c']}°C), pluie {r0['pluie_pct']} %, vent {r0['vent_kmh']} km/h"
+        tips = weather_tips(rows)
+        lines.append(meteo + (" — " + " ; ".join(tips) if tips else ""))
+    lines.append("👉 " + ("Séance exigeante : repas riche en glucides ce soir, hydrate-toi et couche-toi tôt."
+                          if hard else "Séance facile : hydrate-toi et vise une bonne nuit, le reste suivra."))
+    return "\n\n".join(lines)
+
+
+def eve_tick(evts, acts, weather, now):
+    """Veille de séance : un seul message, à partir de EVE_HOUR, si une course est prévue demain."""
+    if not (EVE_HOUR <= now.hour <= 23):
+        return
+    tomorrow = (now.date() + datetime.timedelta(days=1))
+    tiso = tomorrow.isoformat()
+    usual = usual_train_hour((acts or {}).get("brut_recent", []), now.date())
+    for e in (evts or []):
+        if e.get("d") != tiso or e.get("category") not in (None, "WORKOUT") or e.get("type") not in (None, *RUN_TYPES):
+            continue
+        try:
+            start = datetime.datetime.combine(tomorrow, datetime.time.fromisoformat(e.get("h") or f"{usual:02d}:00"))
+        except ValueError:
+            continue
+        key = f"veille|{tiso}|{e.get('nom') or 'Séance'}"
+        if claim("seen_reports", key):
+            try:
+                _push_plain(build_eve(e, start, weather), "Veille auto")
+            except Exception:
+                release("seen_reports", key)
+                logging.exception("veille")
 
 
 def reminders_tick(evts, acts, weather, now=None):
     """Rappel météo avant la séance du jour, relance le soir si elle n'est pas détectée. Messages écrits par le code, sans Gemini."""
     now = now or datetime.datetime.now()
+    eve_tick(evts, acts, weather, now)
     today = now.date()
     iso = today.isoformat()
     todays = [e for e in (evts or []) if e.get("d") == iso and e.get("category") in (None, "WORKOUT") and e.get("type") in (None, *RUN_TYPES)]
@@ -2473,7 +2902,7 @@ def reminders_tick(evts, acts, weather, now=None):
             key = f"relance|{iso}|{nom}"
             if claim("seen_reports", key):
                 try:
-                    _push_plain(build_followup(e), "Relance auto")
+                    _push_plain(build_followup(e), "Relance auto", followup_buttons(e, iso))
                 except Exception:
                     release("seen_reports", key)
                     logging.exception("relance")
@@ -2488,6 +2917,28 @@ def bg_init():
             mark_seen("seen_well", str(well[0]["d"]))
     except Exception:
         logging.exception("Erreur init bg_loop")
+
+
+SUIVI_HOUR = int(os.environ.get("SUIVI_HOUR", "10"))   # heure à partir de laquelle un suivi dû est envoyé s'il n'a pas déjà été évoqué
+
+
+def suivi_tick(prof, weather, well, acts, evts, now=None):
+    """Un suivi dû et pas encore évoqué : message court et chaleureux, une fois par jour."""
+    now = now or datetime.datetime.now()
+    if now.hour < SUIVI_HOUR or not due_followups(now.date()):
+        return
+    key = f"suivi|{now.date().isoformat()}"
+    if not claim("seen_reports", key):
+        return
+    try:
+        todo = "; ".join(f["txt"] for f in due_followups(now.date()))
+        msg = f"Suivi à faire : {todo}{AUTO_SUFFIX}"
+        ans = generate_ai(make_prompt(prof, weather, well, acts, evts, msg, series=False), allow_tools=False)
+        _push("💬", ans, "Suivi auto")
+        ack_followups(ans, force=True)
+    except Exception as e:
+        release("seen_reports", key)
+        logging.warning(f"Suivi différé : {e}")
 
 
 def bg_tick():
@@ -2515,6 +2966,7 @@ def bg_tick():
             ans = generate_ai(make_prompt(prof, weather, well, acts, evts, msg, series=a), allow_tools=False, level=THINKING_DEEP)
             _push("🏁 <b>Nouvelle séance détectée !</b>", ans, "Débrief auto")
             ack_alert(well, ans, acts)
+            ack_followups(ans)
         except Exception as e:
             release("seen_acts", act_id)
             logging.warning(f"Débrief différé ({act_id}) : {e}")
@@ -2528,6 +2980,7 @@ def bg_tick():
             ans = generate_ai(make_prompt(prof, weather, well, acts, evts, msg, series=False), allow_tools=False)
             _push("☀️ <b>Réveil détecté</b>", ans, "Brief auto")
             ack_alert(well, ans, acts)
+            ack_followups(ans)
         except Exception as e:
             release("seen_well", str(well[0]["d"]))
             logging.warning(f"Brief réveil différé : {e}")
@@ -2545,12 +2998,14 @@ def bg_tick():
                 ans = generate_ai(make_prompt(prof, weather, well, acts, evts, msg, series=False), allow_tools=False, level=THINKING_DEEP)
                 _push("📊 <b>Bilan hebdomadaire du Coach</b>", ans, "Bilan Hebdo")
                 ack_alert(well, ans, acts)
+                ack_followups(ans)
             except Exception as e:
                 release("seen_reports", week_id)
                 logging.warning(f"Bilan hebdo différé : {e}")
 
     try:
         reminders_tick(evts, acts, weather)
+        suivi_tick(prof, weather, well, acts, evts)
     except Exception:
         logging.exception("reminders_tick")
 
@@ -2604,6 +3059,8 @@ if __name__ == "__main__":
     app = ApplicationBuilder().token(TG_TOKEN).build()
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_text))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(CommandHandler("cout", handle_cost))
+    app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_error_handler(on_error)
     app.run_polling(drop_pending_updates=True)
