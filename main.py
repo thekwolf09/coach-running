@@ -88,7 +88,6 @@ JOURS_MAP = {
 }
 RUN_TYPES = {"Run", "TrailRun", "VirtualRun"}
 KEEP_CATEGORIES = {"WORKOUT", "RACE_A", "RACE_B", "RACE_C", "SICK", "INJURY", "HOLIDAY"}
-ACWR_LIMIT = 1.35
 LOAD_DANGER, LOAD_EXTREME = 1.8, 2.0     # au-delà, le risque est élevé même si la récupération est bonne (extrême), ou sauf si elle est bonne (1,8)
 LOAD_LOW, LOAD_CAUTION, LOAD_HIGH = 0.8, 1.3, 1.5   # ratio de charge 7 j / 28 j : plage optimale 0,8 à 1,5
 ALLOWED_REACTIONS = {"👍", "❤", "🔥", "🥰", "👏", "😁", "🤔", "🎉", "🤩", "👌", "💯", "⚡", "🏆", "😎", "🤝", "🫡"}
@@ -118,6 +117,12 @@ def db_exec(sql, params=(), fetch=False):
 
 def init_db():
     os.makedirs(os.path.dirname(os.path.abspath(DB)), exist_ok=True)
+    conn = sqlite3.connect(DB, timeout=10)    # WAL : lectures et écritures simultanées (boucle de fond + conversation) sans « database is locked »
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+    finally:
+        conn.close()
     db_exec("CREATE TABLE IF NOT EXISTS notes (id INTEGER PRIMARY KEY AUTOINCREMENT, d TEXT, txt TEXT)")
     db_exec("CREATE TABLE IF NOT EXISTS seen_acts (id TEXT PRIMARY KEY)")
     db_exec("CREATE TABLE IF NOT EXISTS seen_well (d TEXT PRIMARY KEY)")
@@ -155,7 +160,7 @@ def save_chat_msg(role: str, text: str):
     db_exec("DELETE FROM chat_history WHERE id NOT IN (SELECT id FROM chat_history ORDER BY id DESC LIMIT 200)")
 
 
-def get_chat_history(limit: int = 6):
+def get_chat_history(limit: int = 10):
     rows = db_exec("SELECT role, txt FROM chat_history ORDER BY id DESC LIMIT ?", (limit,), fetch=True)
     return [{"role": r[0], "text": r[1][:(600 if r[0] == "athlete" else 350)]} for r in reversed(rows)]
 
@@ -401,7 +406,6 @@ def fetch_wellness():
 
 
 RAMP_LIMIT = 5.0              # points de CTL gagnés en 7 jours
-ROLLING_ACWR_LIMIT = 1.3       # charge des 7 derniers jours / moyenne hebdomadaire des 28 derniers jours
 
 
 def _age_days(d_str, today=None):
@@ -646,6 +650,11 @@ def _dash_charge(c):
             mono = (sum(l7) / 7) / sd
             t += f" ; monotonie {mono:.1f}, tension {acute * mono:.0f}"
         parts.append(t)
+    ew = ewma_acwr(acts)
+    if ew is not None:
+        gap_m = f" ; les deux méthodes divergent ({risk.get('ratio_charge')} en moyenne simple) : un pic isolé ou une reprise, relativise" \
+            if risk.get("ratio_charge") and abs(ew - risk["ratio_charge"]) > 0.3 else ""
+        parts.append(f"ratio EWMA 7 j / 28 j (moyennes mobiles exponentielles) : {ew}{gap_m}")
     ref = next((w for w in well if (w.get("atl") or 0) > 0 and (w.get("ctl") or 0) > 0), None)
     if ref:
         age = _age_days(ref.get("d")) or 0
@@ -691,7 +700,7 @@ def _dash_faits(c):
             if longest["id"] == runs[0]["id"] and longest["km"] >= 8:
                 out.append(f"plus longue sortie des {RAW_DAYS} derniers jours : {longest['km']:.1f} km")
     except Exception:
-        pass
+        logging.debug("erreur ignorée", exc_info=True)
     try:
         km = _week_km(c["acts"])
         last = _monday(today) - datetime.timedelta(days=7)
@@ -708,19 +717,19 @@ def _dash_faits(c):
         if weeks_ok >= 3:
             out.append(f"{weeks_ok} semaines d'affilée avec au moins 3 courses")
     except Exception:
-        pass
+        logging.debug("erreur ignorée", exc_info=True)
     try:
         ew = _easy_weeks(c)
         if len(ew) >= 3 and ew[0][1] < min(x[1] for x in ew[1:]) - 4:
             out.append(f"allure facile record à FC basse : {_mmss(ew[0][1])} @ {ew[0][2]:.0f} bpm (précédent meilleur {_mmss(min(x[1] for x in ew[1:]))})")
     except Exception:
-        pass
+        logging.debug("erreur ignorée", exc_info=True)
     try:
         hist = effort_history(c["details"])
         if len(hist) >= 3 and hist[-1]["pace_s"] < min(h["pace_s"] for h in hist[:-1]) and (_age_days(hist[-1]["d"], today) or 99) <= 3:
             out.append(f"meilleur effort structuré jamais enregistré : {_mmss(hist[-1]['pace_s'])}/km (précédent {_mmss(min(h['pace_s'] for h in hist[:-1]))})")
     except Exception:
-        pass
+        logging.debug("erreur ignorée", exc_info=True)
     try:
         hrv = _vals(well, "hrv", 0, 27)
         if len(hrv) >= 10 and hrv[0] >= max(hrv) and (_age_days(next((w["d"] for w in well if w.get("hrv")), None), today) or 99) <= 2:
@@ -729,14 +738,14 @@ def _dash_faits(c):
         if len(rhr) >= 10 and min(rhr[:3]) <= min(rhr[3:]) - 1:
             out.append(f"FC de repos au plus bas depuis 4 semaines ({min(rhr[:3]):.0f})")
     except Exception:
-        pass
+        logging.debug("erreur ignorée", exc_info=True)
     try:
         for g in (c["prof"] or {}).get("materiel") or []:
             mt = re.search(r"^(.*?) \(.*\) : (\d+) km", g)
             if mt and int(mt.group(2)) >= 600:
                 out.append(f"{mt.group(1)} : {mt.group(2)} km, zone de renouvellement à partir de 700-800 km")
     except Exception:
-        pass
+        logging.debug("erreur ignorée", exc_info=True)
     return ("FAITS MARQUANTS (détectés par le code : félicite uniquement ce qui est réel) : " + " | ".join(out[:4])) if out else None
 
 
@@ -919,6 +928,23 @@ def plan_phase(days_left):
     return "semaine de course (fraîcheur avant tout)"
 
 
+def riegel(t1, d1_km, d2_km=5.0, k=1.06):
+    """Formule de Riegel : T2 = T1 × (D2 / D1)^1,06. Valable pour un effort MAXIMAL de 3 min à 3 h, pas pour une séance à allure contrôlée."""
+    return t1 * (d2_km / d1_km) ** k
+
+
+def ewma_acwr(acts, days=90):
+    """Ratio charge aiguë / chronique par moyennes mobiles exponentielles (7 j / 28 j, Williams) : réagit plus vite qu'une moyenne simple."""
+    loads = list(reversed(_daily_loads(acts, days)))
+    if sum(loads) <= 0:
+        return None
+    a = cr = loads[0]
+    for x in loads[1:]:
+        a += (x - a) * 2 / 8
+        cr += (x - cr) * 2 / 29
+    return round(a / cr, 2) if cr > 0 else None
+
+
 def _dash_objectif(c):
     today = c["today"]
     days_left = (GOAL_DATE - today).days
@@ -947,6 +973,17 @@ def _dash_objectif(c):
     if tops:
         t = min(tops, key=lambda x: _pace_sec(x["allure"]))
         parts.append(f"meilleure sortie de 4,5 à 6,5 km (6 mois) : {_mmss(_pace_sec(t['allure']))}/km sur {t['distance_km']} km le {t['date']}")
+    if est:
+        cands = [t for t in (c["acts"].get("top_performances_recentes") or []) if 3 <= (t.get("distance_km") or 0) <= 10 and _pace_sec(t.get("allure"))]
+        near = [t for t in cands if _pace_sec(t["allure"]) <= est * 1.10]
+        if near:
+            t = min(near, key=lambda x: riegel(_pace_sec(x["allure"]) * x["distance_km"], x["distance_km"]))
+            t5 = riegel(_pace_sec(t["allure"]) * t["distance_km"], t["distance_km"])
+            parts.append(f"Riegel (T2 = T1 × (D2/D1)^1,06) sur la sortie de {t['distance_km']} km à {_mmss(_pace_sec(t['allure']))}/km du {t['date']} : "
+                         f"5 km en {_mmss(t5)} ({_mmss(t5 / 5)}/km), à lire comme un plafond tant que ce n'était pas un effort maximal")
+        else:
+            parts.append("Riegel non applicable : aucune sortie de 3 à 10 km proche de ton allure d'effort, or la formule exige un effort maximal ; "
+                         "un test de 3 km ou une course fiabiliserait l'estimation")
     if est and goal_pace:
         gap = est - goal_pace
         if gap > 0:
@@ -2206,9 +2243,9 @@ def usage_report():
     return "\n".join(lines)
 
 
-def _build_config(allow_tools, level):
+def _build_config(allow_tools, level, system=None):
     kwargs = dict(
-        system_instruction=SYSTEM_INSTRUCTION,
+        system_instruction=system or SYSTEM_INSTRUCTION,
         tools=TOOLS if allow_tools else None,
         temperature=0.3,
         automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
@@ -2219,10 +2256,23 @@ def _build_config(allow_tools, level):
     return types.GenerateContentConfig(**kwargs)
 
 
-def call_gemini(contents, allow_tools=True, level=None):
+DAILY_BUDGET_USD = float(os.environ.get("DAILY_BUDGET_USD", "1.5"))   # filet de sécurité : ~50 fois l'usage normal
+
+
+def _spent_today():
+    try:
+        return float(json.loads(kv_get(f"usage|{datetime.date.today().isoformat()}") or "{}").get("usd", 0.0))
+    except Exception:
+        return 0.0
+
+
+def call_gemini(contents, allow_tools=True, level=None, system=None):
+    if _spent_today() >= DAILY_BUDGET_USD:
+        raise AIError(f"⚠️ Budget Gemini du jour atteint ({_spent_today():.2f} $ sur {DAILY_BUDGET_USD:.2f} $). Il se réinitialise à minuit ; "
+                      "augmente DAILY_BUDGET_USD si c'est voulu.")
     last = ""
     for attempt in range(3):
-        cfg = _build_config(allow_tools, level)
+        cfg = _build_config(allow_tools, level, system)
         try:
             with AI_LOCK:
                 r = ai_client.models.generate_content(model=MODEL_NAME, contents=contents, config=cfg)
@@ -2250,9 +2300,9 @@ def call_gemini(contents, allow_tools=True, level=None):
     raise AIError("⚠️ Gemini est saturé, réessaie dans une minute.")
 
 
-def generate_ai(contents, allow_tools=True, level=None) -> str:
+def generate_ai(contents, allow_tools=True, level=None, system=None) -> str:
     """Un seul appel Gemini. Les outils sont executes une seule fois, hors de la boucle de retry."""
-    r = call_gemini(contents, allow_tools=allow_tools, level=level)
+    r = call_gemini(contents, allow_tools=allow_tools, level=level, system=system)
     calls = (r.function_calls or []) if allow_tools else []
     if calls:
         results = []
@@ -2417,10 +2467,11 @@ def make_prompt(prof, weather, well, acts, evts, user_msg, series="auto"):
     )
     series_block = build_series_block(acts, user_msg, series)
     daily, weekly = split_wellness(well)
-    hist = "\n".join(f"{'athlète' if h['role'] == 'athlete' else 'coach'}: {h['text']}" for h in get_chat_history(6)) or "(vide)"
+    hist = "\n".join(f"{'athlète' if h['role'] == 'athlete' else 'coach'}: {h['text']}" for h in get_chat_history(10)) or "(vide)"
     parts = [
         _block("PROFIL ATHLÈTE", dict(prof or {}, **({"prenom": ATHLETE_NAME} if ATHLETE_NAME else {}))),
         _block("MÉMOIRE DURABLE", get_notes()),
+        *(["CARNET DE BORD (résumé des échanges plus anciens avec l'athlète) :\n" + kv_get("chat_summary")] if kv_get("chat_summary") else []),
         (f"TON DU COACH (choisi par l'athlète) : {COACH_TONE}" if COACH_TONE else "TON DU COACH : naturel, chaleureux et direct"),
         _tblock("SANTÉ, un jour par ligne, du plus récent au plus ancien (sommeil_h, hrv, hrv_base = référence HRV, fc_repos, tsb, atl, ctl ; score_sommeil, readiness, vo2max, fatigue, courbatures, stress, humeur, motivation = mesures de la montre et ressenti saisi par l'athlète, échelles d'Intervals, colonnes présentes seulement si renseignées)", daily, WELL_COLS, drop_empty=True),
     ]
@@ -2523,6 +2574,31 @@ def airy(text):
     return re.sub(r"\n{3,}", "\n\n", "\n".join(out)).strip()
 
 
+def _tg_post(method, payload, tries=3):
+    """POST Telegram avec attente du délai imposé (429 retry_after) et nouvelles tentatives sur erreur réseau ou 5xx."""
+    r = None
+    for k in range(tries):
+        try:
+            r = requests.post(f"{TG_API}/{method}", json=payload, timeout=15)
+        except Exception as err:
+            logging.error(f"Erreur Telegram ({method}, essai {k + 1}/{tries}) : {err}")
+            time.sleep(1 + 2 * k)
+            continue
+        if r.status_code == 429:
+            try:
+                wait = float((r.json().get("parameters") or {}).get("retry_after", 3))
+            except Exception:
+                wait = 3.0
+            logging.warning(f"Telegram 429 : attente de {wait:g} s")
+            time.sleep(min(wait, 20) + 0.5)
+            continue
+        if r.status_code >= 500:
+            time.sleep(1 + 2 * k)
+            continue
+        return r
+    return r
+
+
 def tg_send(chat_id, text, buttons=None):
     """Envoi synchrone : HTML nettoyé, découpé à 4096 caractères, repli en texte brut.
     buttons : lignes de boutons [[(libellé, callback_data), ...], ...] affichées sous le dernier morceau."""
@@ -2534,19 +2610,15 @@ def tg_send(chat_id, text, buttons=None):
     chunks = split_message(text)
     for i, chunk in enumerate(chunks):
         extra = {"reply_markup": markup} if (markup and i == len(chunks) - 1) else {}
-        try:
-            r = requests.post(f"{TG_API}/sendMessage",
-                              json={"chat_id": chat_id, "text": chunk, "parse_mode": "HTML", **extra}, timeout=15)
-            if r.status_code == 200:
-                continue
+        r = _tg_post("sendMessage", {"chat_id": chat_id, "text": chunk, "parse_mode": "HTML", **extra})
+        if r is not None and r.status_code == 200:
+            continue
+        if r is not None:
             logging.warning(f"Telegram a refusé le HTML ({r.status_code}) : {r.text[:200]}")
-        except Exception as err:
-            logging.error(f"Erreur envoi Telegram : {err}")
-        try:
-            plain = html.unescape(re.sub(r"<[^>]+>", "", chunk))
-            requests.post(f"{TG_API}/sendMessage", json={"chat_id": chat_id, "text": plain, **extra}, timeout=15)
-        except Exception:
-            logging.exception("Envoi Telegram en texte brut impossible")
+        plain = html.unescape(re.sub(r"<[^>]+>", "", chunk))
+        r2 = _tg_post("sendMessage", {"chat_id": chat_id, "text": plain, **extra})
+        if r2 is None or r2.status_code != 200:
+            logging.error("Envoi Telegram en texte brut impossible")
 
 
 def extract_reaction(text):
@@ -2648,7 +2720,7 @@ async def _typing_loop(bot, cid, action):
     except asyncio.CancelledError:
         raise
     except Exception:
-        pass
+        logging.debug("erreur ignorée", exc_info=True)
 
 
 async def _stop_typing(task):
@@ -2759,7 +2831,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await q.answer()
     except Exception:
-        pass
+        logging.debug("erreur ignorée", exc_info=True)
     action, _, tok = str(q.data or "").partition("|")
     raw = kv_get(f"cb|{tok}")
     cid = q.message.chat_id if q.message else TG_USER
@@ -2771,7 +2843,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await q.edit_message_reply_markup(reply_markup=None)    # un seul appui : le clavier disparaît
     except Exception:
-        pass
+        logging.debug("erreur ignorée", exc_info=True)
     if action == "mv":
         tomorrow = (datetime.date.fromisoformat(d) + datetime.timedelta(days=1)).isoformat()
         res = await asyncio.to_thread(deplacer_seance, d, tomorrow, nom)
@@ -2989,8 +3061,44 @@ def suivi_tick(prof, weather, well, acts, evts, now=None):
         logging.warning(f"Suivi différé : {e}")
 
 
+SUMMARY_SYSTEM = (
+    "Tu tiens le carnet de bord d'un coach de course à pied. Résume en français, en 120 mots maximum, ce qui compte pour la suite : état physique "
+    "et sensations de l'athlète, blessures, décisions prises, engagements du coach, matériel, humeur, préférences exprimées, sujets en cours. "
+    "Ne répète pas les chiffres d'entraînement (le coach les a déjà), pas de formule de politesse, texte brut sans mise en forme.")
+SUMMARY_EVERY, KEEP_VERBATIM = 16, 10
+_BG_ERR = {"n": 0, "alerted": 0.0}
+
+
+def update_chat_summary():
+    """Résume en arrière-plan les échanges plus anciens que les 10 derniers messages (un appel court tous les ~16 messages)."""
+    last = int(kv_get("chat_summary_upto") or 0)
+    rows = db_exec("SELECT id, role, txt FROM chat_history WHERE id>? ORDER BY id", (last,), fetch=True) or []
+    if len(rows) < SUMMARY_EVERY + KEEP_VERBATIM:
+        return False
+    batch = rows[:-KEEP_VERBATIM]
+    convo = "\n".join(f"{'athlète' if r[1] == 'athlete' else 'coach'} : {r[2][:400]}" for r in batch)
+    text = generate_ai(f"RÉSUMÉ ACTUEL :\n{kv_get('chat_summary') or '(vide)'}\n\nNOUVEAUX ÉCHANGES :\n{convo}\n\n"
+                       "Écris le résumé mis à jour (garde l'essentiel de l'ancien, intègre le nouveau, supprime ce qui est dépassé).",
+                       allow_tools=False, level=THINKING_ROUTINE, system=SUMMARY_SYSTEM)
+    kv_set("chat_summary", text.strip()[:1200])
+    kv_set("chat_summary_upto", str(batch[-1][0]))
+    return True
+
+
+def check_data_health(well, acts):
+    """Prévient (une fois par jour) quand Intervals ne renvoie plus rien trois relevés de suite : clé invalide, service injoignable."""
+    if not well and not (acts or {}).get("brut_recent"):
+        n = int(kv_get("health_fail") or 0) + 1
+        kv_set("health_fail", str(n))
+        if n >= 3 and claim("seen_reports", f"alerte_donnees|{datetime.date.today().isoformat()}"):
+            tg_send(TG_USER, "⚠️ <b>Je ne lis plus tes données Intervals</b> (3 relevés vides de suite) : clé API invalide, identifiant athlète ou service injoignable. Regarde les logs Railway.")
+    else:
+        kv_set("health_fail", "0")
+
+
 def bg_tick():
     prof, weather, well, acts, evts = get_all_data()
+    check_data_health(well, acts)
     today = datetime.date.today()
 
     # 1. Nouvelles activités (au plus MAX_DEBRIEFS_PER_CYCLE débriefs, les autres sont marquées vues)
@@ -3054,6 +3162,7 @@ def bg_tick():
     try:
         reminders_tick(evts, acts, weather)
         suivi_tick(prof, weather, well, acts, evts)
+        update_chat_summary()
     except Exception:
         logging.exception("reminders_tick")
 
@@ -3065,8 +3174,16 @@ def bg_loop():
         time.sleep(BG_INTERVAL)
         try:
             bg_tick()
+            _BG_ERR["n"] = 0
         except Exception:
             logging.exception("Erreur boucle bg_loop")
+            _BG_ERR["n"] += 1
+            if _BG_ERR["n"] >= 4 and time.time() - _BG_ERR["alerted"] > 21600:
+                _BG_ERR["alerted"] = time.time()
+                try:
+                    tg_send(TG_USER, "⚠️ <b>Erreurs répétées en arrière-plan</b> (4 cycles de suite) : les alertes automatiques ne partent peut-être plus. Regarde les logs Railway.")
+                except Exception:
+                    logging.debug("alerte impossible", exc_info=True)
 
 
 # --------------------------------------------------------------------------
