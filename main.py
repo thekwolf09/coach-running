@@ -89,6 +89,7 @@ JOURS_MAP = {
 RUN_TYPES = {"Run", "TrailRun", "VirtualRun"}
 KEEP_CATEGORIES = {"WORKOUT", "RACE_A", "RACE_B", "RACE_C", "SICK", "INJURY", "HOLIDAY"}
 ACWR_LIMIT = 1.35
+LOAD_DANGER, LOAD_EXTREME = 1.8, 2.0     # au-delà, le risque est élevé même si la récupération est bonne (extrême), ou sauf si elle est bonne (1,8)
 LOAD_LOW, LOAD_CAUTION, LOAD_HIGH = 0.8, 1.3, 1.5   # ratio de charge 7 j / 28 j : plage optimale 0,8 à 1,5
 ALLOWED_REACTIONS = {"👍", "❤", "🔥", "🥰", "👏", "😁", "🤔", "🎉", "🤩", "👌", "💯", "⚡", "🏆", "😎", "🤝", "🫡"}
 
@@ -474,9 +475,38 @@ def _training_streak(acts):
     return n
 
 
+def recovery_profile(well):
+    """Croise HRV, sommeil et FC repos : la même charge ne coûte pas pareil quand le corps récupère bien. Score de -6 à +6."""
+    score, pts, seen = 0, [], 0
+    h7, h28 = _avg(_vals(well, "hrv", 0, 6)), _avg(_vals(well, "hrv", 0, 27))
+    if h7 and h28:
+        seen += 1
+        r = h7 / h28
+        score += 2 if r >= 1.0 else 1 if r >= 0.95 else 0 if r >= 0.90 else -2
+        pts.append(f"HRV 7 j {(r - 1) * 100:+.0f} % vs 28 j")
+    last = next((w for w in well if w.get("hrv") and w.get("hrv_base")), None)
+    if last:
+        r = last["hrv"] / last["hrv_base"]
+        score += 1 if r >= 1.0 else -1 if r < 0.90 else 0
+        pts.append(f"dernière HRV {(r - 1) * 100:+.0f} % vs référence")
+    sl = _avg(_vals(well, "sleep_h", 0, 6))
+    if sl is not None:
+        seen += 1
+        score += 2 if sl >= 7.5 else 1 if sl >= 7.0 else 0 if sl >= 6.5 else -1 if sl >= 6.0 else -2
+        pts.append(f"sommeil moyen {sl:.1f} h sur 7 jours")
+    r3, r28 = _avg(_vals(well, "rhr", 0, 2)), _avg(_vals(well, "rhr", 7, 34))
+    if r3 and r28:
+        seen += 1
+        score += 1 if r3 - r28 <= 2 else -2 if r3 - r28 >= 5 else 0
+        pts.append(f"FC repos {r3 - r28:+.0f} bpm vs base")
+    label = "inconnue" if seen < 2 else "excellente" if score >= 4 else "bonne" if score >= 2 else "moyenne" if score >= 0 else "basse"
+    return {"score": score, "label": label, "points": pts}
+
+
 def evaluate_injury_risk(well, acts=None):
     """Risque de surcharge. Référence : le ratio de charge 7 j / 28 j (plage optimale 0,8 à 1,5). Le ratio ATL/CTL est gonflé après une coupure : il ne sert qu'en dernier recours.
-    DANGER : ratio au-dessus de la plage ET une confirmation (volume, jours consécutifs, signal physiologique), ratio >= 1,8,
+    La charge est croisée avec la récupération (HRV, sommeil, FC repos) : charge haute + bonne récupération = MAITRISEE (pas une alerte).
+    DANGER : ratio au-dessus de la plage ET une confirmation sans bonne récupération, ratio >= 1,8 sans bonne récupération, ratio >= 2,0,
     ou ratio haut + 2 signaux physiologiques. VIGILANCE : ratio en haut de plage ou un signal isolé."""
     if not well:
         return {"acwr": None, "acwr_glissant": None, "rampe_ctl_7j": None, "ratio_charge": None, "alerte_surcharge": False,
@@ -537,8 +567,13 @@ def evaluate_injury_risk(well, acts=None):
     if sleep7 is not None and sleep7 < 6.0:
         physio.append(f"sommeil moyen {sleep7:.1f} h sur 7 jours")
 
-    if (level >= 2 and (confirm or physio)) or (ratio is not None and ratio >= 1.8) or (level >= 1 and len(physio) >= 2):
+    recup = recovery_profile(well)
+    good = recup["label"] in ("excellente", "bonne") and not physio
+    if ((level >= 2 and (confirm or physio) and not good) or (ratio is not None and ratio >= LOAD_EXTREME)
+            or (ratio is not None and ratio >= LOAD_DANGER and not good) or (level >= 1 and len(physio) >= 2)):
         statut = "DANGER"
+    elif level >= 1 and good:
+        statut = "MAITRISEE"
     elif level >= 1 or physio:
         statut = "VIGILANCE"
     elif ratio is None and len(pts) < 2:
@@ -547,7 +582,8 @@ def evaluate_injury_risk(well, acts=None):
         statut = "OPTIMAL"
     return {"acwr": acwr, "acwr_glissant": rolling, "rampe_ctl_7j": ramp, "ratio_charge": ratio, "ratio_source": source,
             "reprise": reprise, "alerte_surcharge": level >= 1, "alerte_vrc": alerte_vrc, "statut": statut,
-            "signaux_charge": charge + confirm, "signaux_physio": physio, "details": charge + confirm + physio}
+            "signaux_charge": charge + confirm, "signaux_physio": physio, "details": charge + confirm + physio,
+            "recup": recup, "signaux_recup": recup["points"]}
 
 
 # ---- Tableau de bord : indicateurs calculés par le code (un LLM calcule mal des moyennes sur 90 lignes)
@@ -588,6 +624,9 @@ def _dash_recup(c):
     sl = _vals(well, "sleep_h", 0, 6)
     if sl:
         parts.append(f"sommeil moyen 7 j {_avg(sl):.1f} h, {sum(1 for x in sl if x < 6.5)} nuit(s) sous 6h30")
+    rc = (c.get("risk") or {}).get("recup")
+    if rc and rc["label"] != "inconnue":
+        parts.append(f"synthèse HRV + sommeil + FC repos : récupération {rc['label']} ({rc['score']:+d} sur 6)")
     return "RÉCUPÉRATION : " + " | ".join(parts) if parts else None
 
 
@@ -923,11 +962,15 @@ def _dash_enveloppe(c):
     loads = _daily_loads(c["acts"], 28)
     if sum(loads) <= 0:
         return None
-    coef = 0.7 if risk.get("statut") == "DANGER" else 1.0
+    st = risk.get("statut")
+    coef = {"VIGILANCE": 0.9, "DANGER": 0.8}.get(st, 1.0)
+    if st == "DANGER" and len(risk.get("signaux_physio") or []) >= 2:
+        coef = 0.7     # double alerte : charge ET récupération dégradées
+    why = {"DANGER": "risque élevé", "VIGILANCE": "vigilance"}.get(st, "")
     chronic, acute = sum(loads) / 4, sum(loads[:7])
     max_load = round(chronic * LOAD_CAUTION * coef)
     parts = [f"charge sur 7 jours glissants : cible ≤ {max_load} (1,3 × moyenne hebdo 28 j de {chronic:.0f}"
-             f"{', réduit de 30 % car risque élevé' if coef < 1 else ''}), cumulée {acute:.0f}, marge {max_load - round(acute):+d} ; "
+             f"{f', réduit de {round((1 - coef) * 100)} % car {why}' if coef < 1 else ''}), cumulée {acute:.0f}, marge {max_load - round(acute):+d} ; "
              f"plafond de la plage optimale (1,5) : {round(chronic * LOAD_HIGH)}"]
     this = _monday(today)
     km = {}
@@ -2051,7 +2094,7 @@ TOOLS_MAP = {f.__name__: f for f in TOOLS}
 # --------------------------------------------------------------------------
 # GEMINI
 # --------------------------------------------------------------------------
-SYSTEM_INSTRUCTION = """Tu es le coach personnel de course à pied de cet athlète, pas un tableau de bord. Tu as l'oeil d'un expert (physiologie de l'endurance, gestion de la charge, biomécanique) et la chaleur d'un coach qui connaît son athlète depuis des mois. Tu le tutoies et, si le champ prenom du PROFIL existe, tu l'appelles par son prénom de temps en temps. Tu écris un français naturel et vivant : phrases variées, humour léger quand il s'y prête, 0 à 2 émojis au maximum. Si un bloc TON DU COACH est fourni, adopte ce ton.
+SYSTEM_INSTRUCTION = """Tu es le coach personnel de course à pied de cet athlète, pas un tableau de bord. Parle comme un coach au bord de la piste, pas comme un analyste de données : un chiffre n'a de valeur que s'il soutient une phrase humaine. Tu as l'oeil d'un expert (physiologie de l'endurance, gestion de la charge, biomécanique) et la chaleur d'un coach qui connaît son athlète depuis des mois. Tu le tutoies et, si le champ prenom du PROFIL existe, tu l'appelles par son prénom de temps en temps. Tu écris un français naturel et vivant : phrases variées, humour léger quand il s'y prête, 0 à 2 émojis au maximum. Si un bloc TON DU COACH est fourni, adopte ce ton.
 
 PERSONNALITÉ
 - Tu écoutes d'abord. Quand l'athlète te raconte quelque chose (sensation, fierté, doute, matériel, anecdote, taquinerie), tu réagis à ce qu'il dit, avec ses mots, avant tout chiffre, et tu relèves ce qu'il y a derrière.
@@ -2061,7 +2104,7 @@ PERSONNALITÉ
 
 RÈGLES
 1. Données : les listes sont triées du plus récent au plus ancien ; la première ligne de santé peut être incomplète (nuit du jour pas encore synchronisée). Le TABLEAU DE BORD est calculé par le code : cite ses chiffres, ne les recalcule pas. Appuie chaque conseil sur les données de l'athlète (allures et FC réellement observées, laps, phases, tendances). N'invente jamais une allure ou une FC cible : justifie-la par ses propres données. cad_spm est en pas par minute. Unités de la dynamique de course : stance_time (temps de contact au sol) en ms, vertical_oscillation en mm (divise par 10 pour des cm), step_length en mm (divise par 1000 pour des m), vertical_ratio en %, watts en W ; présente-les dans ces unités lisibles.
-2. Charge : la référence est le RATIO DE CHARGE (charge des 7 derniers jours / moyenne hebdomadaire des 28 derniers jours), plage optimale 0,8 à 1,5. Le ratio ATL/CTL d'Intervals est gonflé après une coupure (CTL bas) : ne t'en sers pas pour alerter. Suis la consigne du bloc SURVEILLANCE : n'emploie le mot « alerte » que pour un risque ÉLEVÉ confirmé par plusieurs signaux, ne le répète jamais le même jour, ne dramatise ni un signal isolé ni un ratio dans la plage. Si les signaux se contredisent, dis-le.
+2. Charge : la référence est le RATIO DE CHARGE (charge des 7 derniers jours / moyenne hebdomadaire des 28 derniers jours), plage optimale 0,8 à 1,5. Le ratio ATL/CTL d'Intervals est gonflé après une coupure (CTL bas) : ne t'en sers pas pour alerter. Suis la consigne du bloc SURVEILLANCE : n'emploie le mot « alerte » que pour un risque ÉLEVÉ confirmé par plusieurs signaux, ne le répète jamais le même jour, ne dramatise ni un signal isolé ni un ratio dans la plage. Statut MAITRISEE = charge haute mais récupération bonne : présente-le comme « tu tapes fort et ton corps encaisse », jamais comme une alerte. Si les signaux se contredisent, dis-le.
 3. Pour modifier le calendrier, appelle l'outil (planifier_seance, deplacer_seance, supprimer_seance, gerer_indisponibilite, restaurer_suppression). Ne dis JAMAIS qu'une séance est planifiée, déplacée ou supprimée sans avoir appelé l'outil. N'appelle aucun outil quand l'athlète demande seulement un conseil ou une analyse, ni dans les modes BRIEF, DEBRIEF et BILAN (messages automatiques).
 4. Donne toujours les dates aux outils au format AAAA-MM-JJ, en t'appuyant sur les repères de dates fournis.
 5. Format Telegram HTML : uniquement <b>, <i> et <code>, aucun Markdown (pas de #, pas de **), aucune autre balise. Pour les listes courtes, utilise des puces « • ».
@@ -2339,6 +2382,11 @@ def surveillance_info(well, acts=None):
         else:
             risk["consigne"] = ("RISQUE ÉLEVÉ, plusieurs signaux concordent (signaux_charge, signaux_physio) : PREMIÈRE FOIS AUJOURD'HUI, dis-le "
                                 "calmement en 2 phrases maximum avec les signaux, puis réponds à la demande sans y revenir.")
+    elif risk["statut"] == "MAITRISEE":
+        risk["consigne"] = ("CHARGE ÉLEVÉE MAÎTRISÉE (ce n'est PAS une alerte) : la charge est haute (signaux_charge) mais la récupération est "
+                            f"{risk['recup']['label']} (signaux_recup). Dis-le positivement en une phrase (« tu tapes fort et ton corps encaisse »), "
+                            "garde un œil sur la récup, n'emploie jamais les mots alerte ou danger, ne recommande pas de baisser le volume, "
+                            "et demande les sensations si c'est naturel.")
     elif risk["statut"] == "VIGILANCE":
         risk["consigne"] = "VIGILANCE (pas une alerte) : n'en parle que si cela change ta recommandation, en une phrase, sans dramatiser."
     elif risk["statut"] == "INCONNU":
