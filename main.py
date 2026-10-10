@@ -2868,6 +2868,79 @@ async def handle_cost(update: Update, context: ContextTypes.DEFAULT_TYPE):
 _CONFLICT = {"first": 0.0, "last": 0.0, "n": 0, "alerted": 0.0}
 
 
+BUILD = "2026-10-10"
+_OPTIONAL_WELLNESS = ("hrv", "rhr", "sleep_h", "weight", "sleep_score", "readiness", "vo2max", "fatigue", "soreness", "stress", "mood", "motivation")
+
+
+def diagnostic():
+    """Autotest affiché par /etat : ce qui fonctionne et ce qui manque, sans aller lire les logs Railway."""
+    ok, ko = "✅", "⚠️"
+    L = [f"<b>État du coach</b> (version {BUILD})"]
+    L.append(f"{ok} Heure locale {datetime.datetime.now():%H:%M}, fuseau {os.environ.get('TZ') or 'du serveur'} · modèle {_esc(MODEL_NAME)} · "
+             f"réflexion {THINKING_ROUTINE}/{THINKING_CHAT}/{THINKING_DEEP}" + ("" if _THINKING_OK["v"] else f" ({ko} refusée par l'API, désactivée)"))
+    L.append(f"{ok if GEMINI_KEY else ko} Clé Gemini {'présente' if GEMINI_KEY else 'ABSENTE'} · dépense du jour {_spent_today():.3f} $ sur {DAILY_BUDGET_USD:.2f} $")
+    try:
+        r = requests.get(BASE, auth=AUTH, timeout=8)
+        L.append(f"{ok if r.status_code == 200 else ko} Intervals : profil HTTP {r.status_code}" + ("" if r.status_code == 200 else " (clé API ou identifiant athlète à vérifier)"))
+    except Exception as err:
+        L.append(f"{ko} Intervals injoignable : {_esc(str(err)[:120])}")
+    try:
+        prof, weather, well, acts, evts = get_all_data()
+    except Exception as err:
+        return "\n".join(L + [f"{ko} Lecture des données impossible : {_esc(str(err)[:150])}"])
+    recent = acts.get("brut_recent", [])
+    got = [k for k in _OPTIONAL_WELLNESS if any(w.get(k) is not None for w in well[:14])]
+    miss = [k for k in _OPTIONAL_WELLNESS if k not in got]
+    L.append(f"{ok if well else ko} Santé : {len(well)} jours (dernier {well[0].get('d') if well else '—'}) · reçu : {', '.join(got) or 'rien'}" + (f" · absent : {', '.join(miss)}" if miss else ""))
+    runs = [a for a in recent if a.get("type") in RUN_TYPES]
+    L.append(f"{ok if recent else ko} Activités : {len(recent)} sur {RAW_DAYS} jours, {len(runs)} courses" + (f" (dernière : {runs[0]['d']} {_esc(runs[0].get('nom') or '')})" if runs else ""))
+    L.append(f"{ok if evts else ko} Calendrier : {len(evts)} événements · météo {'ok' if (weather or {}).get('horaire') else 'indisponible'} · matériel suivi : {len((prof or {}).get('materiel') or [])}")
+    if runs:
+        try:
+            r = requests.get(f"{API_ROOT}/activity/{runs[0]['id']}/streams.json", auth=AUTH, timeout=25)
+            names = sorted(parse_streams(r.json()).keys()) if r.status_code == 200 else []
+            L.append(f"{ok if names else ko} Courbes de la dernière course ({len(names)}) : {_esc(', '.join(names)) or 'aucune'}")
+        except Exception as err:
+            L.append(f"{ko} Courbes illisibles : {_esc(str(err)[:100])}")
+    vol = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH")
+    if vol and os.path.abspath(DB).startswith(vol):
+        pers = f"{ok} base sur le Volume ({_esc(vol)}) : la mémoire survit aux déploiements"
+    elif vol:
+        pers = f"{ko} Volume monté sur {_esc(vol)} mais la base est ailleurs : mets DB_PATH={_esc(vol)}/coach_brain.db"
+    else:
+        pers = f"{ko} aucun Volume détecté : la base est effacée à chaque déploiement (notes, carnet, suivis)"
+    n = lambda q: db_exec(q, fetch=True)[0][0]
+    size = os.path.getsize(DB) // 1024 if os.path.exists(DB) else 0
+    L.append(pers)
+    L.append(f"{ok} Mémoire : {n('SELECT COUNT(*) FROM notes')} notes · {n('SELECT COUNT(*) FROM followups WHERE done=0')} suivis en attente · "
+             f"{n('SELECT COUNT(*) FROM chat_history')} messages · carnet {len(kv_get('chat_summary') or '')} car. · base {size} Ko")
+    L.append(f"{ok if TG_USER else ko} Telegram : utilisateur autorisé {'défini' if TG_USER else 'ABSENT'}")
+    return "\n".join(L)
+
+
+HELP_TEXT = (
+    "<b>Ce que je sais faire</b>\n\n"
+    "• <b>Analyser :</b> « analyse ma séance d'hier », « donne-moi le csv complet »\n"
+    "• <b>Planifier :</b> « planifie un footing demain 18h », « décale ma séance à jeudi », « annule la séance de samedi », « annule la dernière suppression »\n"
+    "• <b>T'aider au quotidien :</b> « il fera quoi dans 1 h ? », « je suis malade jusqu'à vendredi », « recommence le bilan matinal »\n"
+    "• <b>Discuter :</b> raconte-moi tes sensations, ton matériel, ta semaine : je retiens ce qui compte\n\n"
+    "<b>Commandes :</b> /etat (autotest complet), /cout (dépense des 7 derniers jours), /aide\n\n"
+    "<b>Réglages (variables Railway) :</b> ATHLETE_NAME, COACH_TONE, THINKING_CHAT, DAILY_BUDGET_USD, REMINDER_LEAD_MIN, FOLLOWUP_HOUR, SUIVI_HOUR, DB_PATH")
+
+
+async def handle_etat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _authorized(update) or not update.message:
+        return
+    text = await asyncio.to_thread(diagnostic)
+    await asyncio.to_thread(tg_send, update.effective_chat.id, text)
+
+
+async def handle_aide(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _authorized(update) or not update.message:
+        return
+    await asyncio.to_thread(tg_send, update.effective_chat.id, HELP_TEXT)
+
+
 async def on_error(update, context: ContextTypes.DEFAULT_TYPE):
     err = context.error
     if isinstance(err, Conflict):
@@ -3226,6 +3299,8 @@ if __name__ == "__main__":
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(CommandHandler("cout", handle_cost))
+    app.add_handler(CommandHandler("etat", handle_etat))
+    app.add_handler(CommandHandler("aide", handle_aide))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_error_handler(on_error)
     app.run_polling(drop_pending_updates=True)
