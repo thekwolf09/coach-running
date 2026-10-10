@@ -1379,6 +1379,90 @@ asyncio.run(m.handle_etat(upd(1), MagicMock())); asyncio.run(m.handle_aide(upd(1
 assert sent[0] == "ETAT" and "Ce que je sais faire" in sent[1] and "/etat" in sent[1] and len(sent) == 2               # l'inconnu est ignoré
 print("TEST16 PASSED")
 '''),
+    ('17_sauvegarde', '17_sauvegarde : sauvegarde de la mémoire dans Telegram et restauration', r'''import sys, importlib.util, os, datetime, json, tempfile, gzip, sqlite3, asyncio, time, types as _t
+from unittest.mock import MagicMock
+for name in ["google", "google.genai", "google.genai.types", "telegram", "telegram.constants", "telegram.ext"]:
+    sys.modules[name] = MagicMock()
+_err = _t.ModuleType("telegram.error"); _err.Conflict = type("Conflict", (Exception,), {}); sys.modules["telegram.error"] = _err
+os.environ.update(INTERVALS_API_KEY="k", GEMINI_API_KEY="g", TELEGRAM_BOT_TOKEN="t", TELEGRAM_USER_ID="1")
+os.chdir(tempfile.mkdtemp())
+spec = importlib.util.spec_from_file_location("main", os.environ["MAIN_PY"] if "MAIN_PY" in os.environ else os.environ["MAIN_PY"])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m); m.init_db(); m.time.sleep = lambda *_: None
+HOME = os.path.dirname(os.path.abspath(m.DB))
+
+class Resp:
+    def __init__(s, c=200, d=None, content=b""): s.status_code, s._d, s.text, s.content = c, d, "x", content
+    def json(s): return s._d
+class Tg:
+    def __init__(s): s.calls, s.sent_bytes, s.pinned, s.file = [], b"", {"message_id": 5, "document": {"file_name": "coach_backup_old.db.gz", "file_id": "F0"}}, b""
+    def post(s, url, **k):
+        meth = url.rsplit("/", 1)[1]; s.calls.append((meth, k.get("json") or k.get("data")))
+        if meth == "getChat": return Resp(200, {"result": {"pinned_message": s.pinned} if s.pinned else {}})
+        if meth == "sendDocument": s.sent_bytes = k["files"]["document"][1].read(); return Resp(200, {"result": {"message_id": 9}})
+        if meth == "getFile": return Resp(200, {"result": {"file_path": "documents/f1"}})
+        return Resp(200, {"ok": True, "result": True})
+    def get(s, url, **k):
+        s.calls.append(("download", url)); return Resp(200, content=s.file)
+tg = Tg(); m.requests = tg
+
+# --- contenu de la sauvegarde : mémoire durable conservée, cache des courbes vidé
+m.save_note("mollet gauche sensible"); m.save_note("GT-2000 à 650 km"); m.add_followup((datetime.date.today() + datetime.timedelta(days=3)).isoformat(), "nouvelles du mollet")
+m.kv_set("chat_summary", "Carnet : prépare un 5 km sub-20.")
+m.db_exec("INSERT INTO act_streams (id, v, blob) VALUES ('s1', ?, ?)", (m.STREAM_VERSION, b"x" * 5000))
+gz, tmp = m.make_backup_file(); raw = gzip.open(gz, "rb").read(); print("sauvegarde :", len(raw) // 1024, "Ko brut,", os.path.getsize(gz) // 1024, "Ko compressée")
+assert raw.startswith(b"SQLite format 3\x00")
+snap = os.path.join(tmp, "check.db"); open(snap, "wb").write(raw); c = sqlite3.connect(snap)
+assert c.execute("SELECT COUNT(*) FROM notes").fetchone()[0] == 2 and c.execute("SELECT COUNT(*) FROM act_streams").fetchone()[0] == 0
+assert c.execute("SELECT v FROM kv WHERE k='chat_summary'").fetchone()[0].startswith("Carnet"); c.close()
+
+# --- envoi : silencieux, épinglé, ancienne sauvegarde dépinglée puis supprimée
+assert m.backup_to_telegram() is True
+order = [c[0] for c in tg.calls]; print(order)
+assert order == ["getChat", "sendDocument", "pinChatMessage", "unpinChatMessage", "deleteMessage"]
+d = dict(tg.calls[1][1]); assert d["disable_notification"] == "true" and "Sauvegarde automatique" in d["caption"]
+assert tg.calls[2][1]["message_id"] == 9 and tg.calls[3][1]["message_id"] == 5 and tg.calls[4][1]["message_id"] == 5
+assert tg.sent_bytes.startswith(b"\x1f\x8b") and m.kv_get("backup_at") and m.kv_get("backup_sig") == m._data_signature()
+# première sauvegarde (rien d'épinglé) et sauvegarde épinglée par erreur d'un autre fichier : on n'y touche pas
+tg.calls.clear(); tg.pinned = None; assert m.backup_to_telegram() is True and [c[0] for c in tg.calls] == ["getChat", "sendDocument", "pinChatMessage"]
+tg.calls.clear(); tg.pinned = {"message_id": 3, "document": {"file_name": "facture.pdf"}}; m.backup_to_telegram(); assert "deleteMessage" not in [c[0] for c in tg.calls]
+
+# --- déclenchement : changement de mémoire (écart de 10 min) ou une fois par nuit
+tg.calls.clear(); assert m.maybe_backup() is False and not tg.calls                       # rien n'a changé
+m.save_note("préfère courir le soir"); assert m.maybe_backup() is False                    # changé mais sauvegarde trop récente
+m.kv_set("backup_at", str(int(time.time()) - 700)); assert m.maybe_backup() is True       # changé et plus de 10 min
+at = lambda h: datetime.datetime.combine(datetime.date.today(), datetime.time(h, 5))
+m.kv_set("backup_at", str(int(time.time()) - 21 * 3600))
+assert m.maybe_backup(at(1)) is False and m.maybe_backup(at(4)) is True                    # sauvegarde de nuit
+m.BACKUP_ON = False; m.kv_set("backup_at", "0"); m.save_note("x"); assert m.maybe_backup() is False; m.BACKUP_ON = True
+
+# --- restauration sur une base vierge (déploiement sans Volume)
+payload = tg.sent_bytes; tg.file = payload; tg.pinned = {"message_id": 9, "document": {"file_name": "coach_backup_x.db.gz", "file_id": "F9"}}
+real_db = m.DB; m.DB = os.path.join(HOME, "neuf", "coach.db"); tg.calls.clear()
+assert m.db_is_blank() is True and m.restore_from_telegram() is True
+assert [c[0] for c in tg.calls] == ["getChat", "getFile", "download"] and "bott/documents/f1" in tg.calls[2][1]
+m.init_db(); assert m.db_exec("SELECT COUNT(*) FROM notes", fetch=True)[0][0] >= 2 and m.kv_get("chat_summary").startswith("Carnet") and not m.db_is_blank()
+assert m.restore_from_telegram() is False                                                  # base déjà remplie : on n'écrase jamais
+# refus : mauvais fichier épinglé, contenu qui n'est pas une base, désactivé
+m.DB = os.path.join(HOME, "autre", "coach.db")
+tg.pinned = {"message_id": 1, "document": {"file_name": "facture.pdf", "file_id": "F"}}; assert m.restore_from_telegram() is False
+tg.pinned = {"message_id": 1, "document": {"file_name": "coach_backup_z.db.gz", "file_id": "F"}}; tg.file = gzip.compress(b"pas une base"); assert m.restore_from_telegram() is False and not os.path.exists(m.DB)
+tg.file = payload[:40]; assert m.restore_from_telegram() is False and not os.path.exists(m.DB)   # fichier tronqué
+tg.file = payload; m.BACKUP_ON = False; assert m.restore_from_telegram() is False; m.BACKUP_ON = True
+assert m.restore_from_telegram() is True; m.DB = real_db                                    # (contrôle : la restauration marche bien une fois les garde-fous levés)
+
+# --- commande /sauvegarde et ligne de /etat
+sent = []; m.tg_send = lambda cid, text, buttons=None: sent.append(text)
+def upd(uid):
+    u = MagicMock(); u.effective_user.id = uid; u.effective_chat.id = 42; return u
+asyncio.run(m.handle_sauvegarde(upd(1), MagicMock())); asyncio.run(m.handle_sauvegarde(upd(999), MagicMock()))
+assert len(sent) == 1 and "Sauvegarde envoyée et épinglée" in sent[0]
+class Fk:
+    def get(s, url, **k): return Resp(200, {})
+m.requests = Fk(); m.get_all_data = lambda: ({}, {}, [], {"brut_recent": []}, [])
+assert "Sauvegarde Telegram : dernière il y a" in m.diagnostic() and "/sauvegarde" in m.HELP_TEXT
+m.db_exec("DELETE FROM kv WHERE k='backup_at'"); assert "aucune pour l'instant" in m.diagnostic()
+print("TEST17 PASSED")
+'''),
 ]
 
 OK_MARKERS = ("PASSED", "PART 2 OK", "ALL TESTS")

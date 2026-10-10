@@ -10,6 +10,9 @@ import zlib
 import bisect
 import html
 import sqlite3
+import gzip
+import shutil
+import tempfile
 import datetime
 import asyncio
 import contextlib
@@ -2868,7 +2871,161 @@ async def handle_cost(update: Update, context: ContextTypes.DEFAULT_TYPE):
 _CONFLICT = {"first": 0.0, "last": 0.0, "n": 0, "alerted": 0.0}
 
 
-BUILD = "2026-10-10"
+# --------------------------------------------------------------------------
+# SAUVEGARDE DE LA MEMOIRE DANS TELEGRAM (sans Volume Railway)
+# Le fichier est envoyé en silence, épinglé dans ta conversation avec le bot, puis relu au démarrage si la base est vide.
+# --------------------------------------------------------------------------
+BACKUP_ON = os.environ.get("BACKUP_TELEGRAM", "1") != "0"
+BACKUP_MIN_GAP_S = 600           # au plus une sauvegarde toutes les 10 minutes
+BACKUP_NAME = "coach_backup"
+
+
+def _tg_json(method, payload):
+    r = _tg_post(method, payload)
+    try:
+        return r.json() if r is not None and r.status_code == 200 else {}
+    except Exception:
+        return {}
+
+
+def _data_signature():
+    """Change quand la mémoire durable change (notes, suivis, carnet, historique d'efforts), pas à chaque message."""
+    row = db_exec("SELECT (SELECT COUNT(*) FROM notes), (SELECT COALESCE(MAX(id), 0) FROM notes), (SELECT COUNT(*) FROM followups), "
+                  "(SELECT COUNT(*) FROM followups WHERE done=1), (SELECT COALESCE(LENGTH(v), 0) FROM kv WHERE k='chat_summary'), "
+                  "(SELECT COUNT(*) FROM efforts)", fetch=True)[0]
+    return "-".join(str(x) for x in row)
+
+
+def make_backup_file():
+    """Copie cohérente de la base (sans le cache des courbes, volumineux et recalculable), compressée. Retourne (chemin, dossier temporaire)."""
+    tmp = tempfile.mkdtemp()
+    snap = os.path.join(tmp, "snap.db")
+    src, dst = sqlite3.connect(DB, timeout=10), sqlite3.connect(snap)
+    try:
+        src.backup(dst)
+        try:
+            dst.execute("DELETE FROM act_streams")
+            dst.commit()
+            dst.execute("VACUUM")
+        except sqlite3.Error:
+            logging.debug("cache des courbes non vidé", exc_info=True)
+    finally:
+        src.close()
+        dst.close()
+    gz = snap + ".gz"
+    with open(snap, "rb") as f, gzip.open(gz, "wb") as g:
+        shutil.copyfileobj(f, g)
+    return gz, tmp
+
+
+def backup_to_telegram():
+    if not (BACKUP_ON and TG_TOKEN and TG_USER):
+        return False
+    tmp = None
+    try:
+        gz, tmp = make_backup_file()
+        old = (_tg_json("getChat", {"chat_id": TG_USER}).get("result") or {}).get("pinned_message") or {}
+        old_id = old.get("message_id") if str((old.get("document") or {}).get("file_name", "")).startswith(BACKUP_NAME) else None
+        name = f"{BACKUP_NAME}_{datetime.datetime.now():%Y%m%d_%H%M}.db.gz"
+        with open(gz, "rb") as fh:
+            r = requests.post(f"{TG_API}/sendDocument", timeout=60, files={"document": (name, fh)},
+                              data={"chat_id": TG_USER, "disable_notification": "true",
+                                    "caption": "💾 Sauvegarde automatique de la mémoire du coach : ne la supprime pas, elle est remplacée toute seule."})
+        res = (r.json().get("result") if r.status_code == 200 else None) or {}
+        if not res.get("message_id"):
+            logging.warning(f"Sauvegarde Telegram refusée ({r.status_code}) : {r.text[:200]}")
+            return False
+        _tg_post("pinChatMessage", {"chat_id": TG_USER, "message_id": res["message_id"], "disable_notification": True})
+        if old_id and old_id != res["message_id"]:
+            _tg_post("unpinChatMessage", {"chat_id": TG_USER, "message_id": old_id})
+            _tg_post("deleteMessage", {"chat_id": TG_USER, "message_id": old_id})   # impossible après 48 h : sans gravité
+        kv_set("backup_at", str(int(time.time())))
+        kv_set("backup_sig", _data_signature())
+        kv_set("backup_kb", str(os.path.getsize(gz) // 1024))
+        logging.info(f"Sauvegarde Telegram envoyée ({os.path.getsize(gz) // 1024} Ko)")
+        return True
+    except Exception:
+        logging.exception("backup_to_telegram")
+        return False
+    finally:
+        if tmp:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+def maybe_backup(now=None):
+    """Sauvegarde si la mémoire durable a changé (au plus toutes les 10 min) et au moins une fois par nuit."""
+    if not BACKUP_ON:
+        return False
+    now = now or datetime.datetime.now()
+    age = time.time() - int(kv_get("backup_at") or 0)
+    changed = _data_signature() != kv_get("backup_sig")
+    if (changed and age >= BACKUP_MIN_GAP_S) or (now.hour >= 3 and age >= 20 * 3600):
+        return backup_to_telegram()
+    return False
+
+
+def db_is_blank():
+    if not os.path.exists(DB) or os.path.getsize(DB) == 0:
+        return True
+    try:
+        conn = sqlite3.connect(DB, timeout=5)
+        try:
+            n = sum(conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0] for t in ("notes", "chat_history", "followups", "kv"))
+        finally:
+            conn.close()
+        return n == 0
+    except sqlite3.Error:
+        return True
+
+
+def restore_from_telegram():
+    """Au démarrage, base vide (déploiement sans Volume) : relit la sauvegarde épinglée dans la conversation."""
+    if not (BACKUP_ON and TG_TOKEN and TG_USER) or not db_is_blank():
+        return False
+    try:
+        doc = ((_tg_json("getChat", {"chat_id": TG_USER}).get("result") or {}).get("pinned_message") or {}).get("document") or {}
+        if not str(doc.get("file_name", "")).startswith(BACKUP_NAME):
+            return False
+        path = (_tg_json("getFile", {"file_id": doc.get("file_id")}).get("result") or {}).get("file_path")
+        if not path:
+            return False
+        r = requests.get(f"https://api.telegram.org/file/bot{TG_TOKEN}/{path}", timeout=60)
+        if r.status_code != 200:
+            return False
+        raw = gzip.decompress(r.content)
+        if not raw.startswith(b"SQLite format 3\x00"):
+            return False
+        os.makedirs(os.path.dirname(os.path.abspath(DB)), exist_ok=True)
+        tmp = DB + ".restore"
+        with open(tmp, "wb") as fh:
+            fh.write(raw)
+        chk = sqlite3.connect(tmp)
+        try:
+            if chk.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+                return False
+        finally:
+            chk.close()
+        for ext in ("", "-wal", "-shm"):
+            if os.path.exists(DB + ext):
+                os.remove(DB + ext)
+        os.replace(tmp, DB)
+        logging.info("Mémoire restaurée depuis la sauvegarde Telegram")
+        return True
+    except Exception:
+        logging.exception("restore_from_telegram")
+        return False
+
+
+async def handle_sauvegarde(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _authorized(update) or not update.message:
+        return
+    ok = await asyncio.to_thread(backup_to_telegram)
+    await asyncio.to_thread(tg_send, update.effective_chat.id,
+                            "✅ Sauvegarde envoyée et épinglée en haut de cette conversation." if ok else "⚠️ Sauvegarde impossible, regarde /etat et les logs.")
+
+
+
+BUILD = "2026-10-11"
 _OPTIONAL_WELLNESS = ("hrv", "rhr", "sleep_h", "weight", "sleep_score", "readiness", "vo2max", "fatigue", "soreness", "stress", "mood", "motivation")
 
 
@@ -2912,6 +3069,9 @@ def diagnostic():
     n = lambda q: db_exec(q, fetch=True)[0][0]
     size = os.path.getsize(DB) // 1024 if os.path.exists(DB) else 0
     L.append(pers)
+    ba = int(kv_get("backup_at") or 0)
+    L.append((f"{ok} Sauvegarde Telegram : dernière il y a {(time.time() - ba) / 3600:.0f} h ({kv_get('backup_kb') or '?'} Ko), restaurée seule après un déploiement"
+              if ba else f"{ko} Sauvegarde Telegram : aucune pour l'instant (envoie /sauvegarde)") if BACKUP_ON else f"{ko} Sauvegarde Telegram désactivée")
     L.append(f"{ok} Mémoire : {n('SELECT COUNT(*) FROM notes')} notes · {n('SELECT COUNT(*) FROM followups WHERE done=0')} suivis en attente · "
              f"{n('SELECT COUNT(*) FROM chat_history')} messages · carnet {len(kv_get('chat_summary') or '')} car. · base {size} Ko")
     L.append(f"{ok if TG_USER else ko} Telegram : utilisateur autorisé {'défini' if TG_USER else 'ABSENT'}")
@@ -2924,7 +3084,7 @@ HELP_TEXT = (
     "• <b>Planifier :</b> « planifie un footing demain 18h », « décale ma séance à jeudi », « annule la séance de samedi », « annule la dernière suppression »\n"
     "• <b>T'aider au quotidien :</b> « il fera quoi dans 1 h ? », « je suis malade jusqu'à vendredi », « recommence le bilan matinal »\n"
     "• <b>Discuter :</b> raconte-moi tes sensations, ton matériel, ta semaine : je retiens ce qui compte\n\n"
-    "<b>Commandes :</b> /etat (autotest complet), /cout (dépense des 7 derniers jours), /aide\n\n"
+    "<b>Commandes :</b> /etat (autotest complet), /cout (dépense des 7 derniers jours), /sauvegarde (copie de ma mémoire dans cette conversation), /aide\n\n"
     "<b>Réglages (variables Railway) :</b> ATHLETE_NAME, COACH_TONE, THINKING_CHAT, DAILY_BUDGET_USD, REMINDER_LEAD_MIN, FOLLOWUP_HOUR, SUIVI_HOUR, DB_PATH")
 
 
@@ -3236,6 +3396,7 @@ def bg_tick():
         reminders_tick(evts, acts, weather)
         suivi_tick(prof, weather, well, acts, evts)
         update_chat_summary()
+        maybe_backup()
     except Exception:
         logging.exception("reminders_tick")
 
@@ -3287,7 +3448,10 @@ def check_config():
 
 if __name__ == "__main__":
     check_config()
+    restored = restore_from_telegram()
     init_db()
+    if restored:
+        tg_send(TG_USER, "🔄 <b>Mémoire restaurée</b> depuis ta dernière sauvegarde : notes, carnet de bord et suivis sont de retour.")
     apply_timezone()
     if STARTUP_DELAY_S > 0:
         logging.info(f"Attente de {STARTUP_DELAY_S} s : l'ancienne instance doit s'arrêter avant le polling Telegram")
@@ -3301,6 +3465,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("cout", handle_cost))
     app.add_handler(CommandHandler("etat", handle_etat))
     app.add_handler(CommandHandler("aide", handle_aide))
+    app.add_handler(CommandHandler("sauvegarde", handle_sauvegarde))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_error_handler(on_error)
     app.run_polling(drop_pending_updates=True)
