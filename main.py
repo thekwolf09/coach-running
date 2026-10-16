@@ -963,10 +963,17 @@ def _dash_objectif(c):
     recent_pts = [h for h in hist if (_age_days(h["d"]) if _age_days(h["d"]) is not None else 999) <= 56]
     if recent_pts:
         best = min(recent_pts, key=lambda h: h["pace_s"])
-        est = best["pace_s"] * 0.95
+        lthr, hr = (c.get("prof") or {}).get("lthr"), best.get("hr")
+        if lthr and hr:
+            ratio = hr / lthr
+            factor, why = ((0.95, "effort modéré") if ratio < 0.93 else (0.965, "effort proche du seuil") if ratio <= 1.0
+                           else (1.0, "effort déjà au niveau d'un 5 km"))
+        else:
+            factor, why = 0.95, "FC absente, valeur par défaut"
+        est = best["pace_s"] * factor
         parts.append(f"meilleur effort structuré de 4 min et plus (8 dernières semaines) : {_mmss(best['pace_s'])}/km sur {best['duree_s']} s "
                      f"à {best.get('hr') or '?'} bpm le {best['d']} ; équivalent 5 km estimé : {_mmss(est)}/km, soit {_mmss(est * 5)} "
-                     f"(hypothèse : allure 5 km = allure de ces efforts − 5 %, ordre de grandeur prudent)")
+                     f"(hypothèse : allure 5 km = allure de ces efforts × {factor:g} ({why}), ordre de grandeur prudent)")
         tr = hist[-4:]
         if len(tr) >= 2 and tr[0]["d"] != tr[-1]["d"]:
             parts.append(f"tendance des meilleurs efforts : {tr[0]['d']} {_mmss(tr[0]['pace_s'])} → {tr[-1]['d']} {_mmss(tr[-1]['pace_s'])} "
@@ -1712,7 +1719,7 @@ _QUESTION_START = re.compile(
 _BRIEF_RE = re.compile(r"bilan matinal|bilan du matin|brief (?:du )?(?:matin|r[ée]veil)|point du matin|recommence le (?:bilan|brief)", re.I)
 _BILAN_RE = re.compile(r"bilan (?:de la )?semaine|bilan hebdo", re.I)
 _PLANIF_REQ = re.compile(
-    r"\b(?:planifie|programme|ajoute|supprime|d[ée]place|d[ée]cale|annule|remplace|reporte|restaure|retire|modifie|adapte|all[èe]ge|raccourcis)\b"
+    r"\b(?:planifie|programme|ajoute|supprime|d[ée]place|d[ée]cale|annule|remplace|reporte|restaure|retire|modifie|(?<!['’])adapte|all[èe]ge|raccourcis)\b"
     r"|(?:peux[- ]tu|pourrais[- ]tu|tu peux|stp|s'il te pla[iî]t|je voudrais|je veux|j'aimerais).{0,60}"
     r"\b(?:planifier|programmer|ajouter|supprimer|d[ée]placer|d[ée]caler|annuler|remplacer|reporter|retirer|modifier|adapter|all[ée]ger|raccourcir)\b", re.I | re.S)
 _FULLRES = re.compile(r"seconde par seconde|\b1 ?hz\b|\bcsv\b|\bbrut|complet|toutes? les donn|tout le d[ée]tail", re.I)
@@ -2021,11 +2028,15 @@ def modifier_seance(date_str: str, titre_actuel: str = "", nouveau_titre: str = 
         h = _hhmm(heure, default=_hhmm(orig_h)) if (heure or "").strip() else _hhmm(orig_h)
         name = (nouveau_titre or "").strip() or ev.get("name") or "Séance Course"
         desc = (description or "").strip() or ev.get("description") or f"Séance : {name}"
+        old_name, old_desc = ev.get("name") or "", (ev.get("description") or "").strip()
+        if name == old_name and desc == old_desc and h == _hhmm(orig_h):
+            return f"⚠️ Rien à modifier : la séance '{name}' du {d} a déjà ces consignes."
         payload = {"name": name, "description": desc, "start_date_local": f"{d}T{h}:00"}
         r = requests.put(f"{BASE}/events/{ev['id']}", auth=AUTH, json=payload, timeout=8)
         if r.status_code in (200, 204):
             invalidate_cache()
-            return f"✅ Séance '{name}' du {d} à {h} mise à jour."
+            return (f"✅ Séance '{name}' du {d} à {h} mise à jour. Avant : « {old_name} »"
+                    + (f" — {old_desc[:140].replace(chr(10), ' | ')}{'…' if len(old_desc) > 140 else ''}" if old_desc else "") + ".")
         logging.error(f"modifier_seance : HTTP {r.status_code} {r.text[:200]}")
         return f"⚠️ Intervals.icu a refusé la modification (HTTP {r.status_code})."
     except DateError as e:
@@ -2361,6 +2372,9 @@ def generate_ai(contents, allow_tools=True, level=None, system=None) -> str:
             except Exception as e:
                 logging.exception(f"Erreur outil {c.name}")
                 results.append(f"⚠️ Erreur pendant {c.name} : {e}")
+        note = (r.text or "").strip()
+        if note and not any(x.startswith("⚠️") for x in results):   # un commentaire ne doit jamais contredire une action ratée
+            results.append(note)
         return "\n\n".join(results)
 
     text = (r.text or "").strip()
@@ -2531,7 +2545,7 @@ def make_prompt(prof, weather, well, acts, evts, user_msg, series="auto"):
         + ("\n".join(dashboard_lines(prof, well, acts, evts)) or "(indisponible)"),
         "",
         f"Objectif prioritaire : {GOAL_TEXT} le {GOAL_DATE.strftime('%d/%m/%Y')} ({goal_line}).",
-        f"Aujourd'hui : {JOURS_FR[today.weekday()]} {today.isoformat()}, il est {datetime.datetime.now():%H:%M} (heure locale).",
+        f"Aujourd'hui : {JOURS_FR[today.weekday()]} {today.isoformat()}.",
         f"Repères de dates : {reperes}.",
         _block("SURVEILLANCE SURCHARGE (statut, signaux et consigne)", surveillance_info(well, acts)),
         _block("MÉTÉO (ville, maintenant, 3 jours, créneaux les plus favorables)", {k: v for k, v in (weather or {}).items() if k != "horaire"}),
@@ -2544,7 +2558,7 @@ def make_prompt(prof, weather, well, acts, evts, user_msg, series="auto"):
                   + "\n".join(f"• {f['txt']} (prévu le {f['due']})" for f in due)]
     if series_block:
         parts += ["", series_block]
-    parts += ["", f"MODE DE RÉPONSE : {detect_mode(user_msg)}", f'MESSAGE DE L\'ATHLÈTE :\n"{user_msg}"']
+    parts += ["", f"Heure locale : {datetime.datetime.now():%H:%M}.", f"MODE DE RÉPONSE : {detect_mode(user_msg)}", f'MESSAGE DE L\'ATHLÈTE :\n"{user_msg}"']
     return "\n".join(parts)
 
 
@@ -3063,7 +3077,7 @@ async def handle_sauvegarde(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             "✅ Sauvegarde envoyée et épinglée en haut de cette conversation." if ok else "⚠️ Sauvegarde impossible, regarde /etat et les logs.")
 
 
-BUILD = "2026-10-14"
+BUILD = "2026-10-15"
 _OPTIONAL_WELLNESS = ("hrv", "rhr", "sleep_h", "weight", "sleep_score", "readiness", "vo2max", "fatigue", "soreness", "stress", "mood", "motivation")
 
 

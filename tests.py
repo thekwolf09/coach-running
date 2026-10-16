@@ -697,7 +697,7 @@ assert "RYTHME : 9 jour(s) d'activité consécutifs, 0 jour(s) de repos sur les 
 assert "ADHÉRENCE AU PLAN (28 derniers jours, course réalisée à ±1 jour) : 1/2 séances ; manquées : " + D(10) + " S2 E2 manquée" in txt
 assert "Z1 3 %" in txt and "Z2 50 %" in txt
 days_left = (m.GOAL_DATE - today).days
-est = 286 * 0.95
+est = 286 * 0.965
 assert f"J-{days_left}, soit {days_left / 7:.1f} semaines" in txt
 assert f"meilleur effort structuré de 4 min et plus (8 dernières semaines) : 4'46/km sur 300 s à 163 bpm le {D(2)}" in txt
 assert f"équivalent 5 km estimé : {m._mmss(est)}/km, soit {m._mmss(est * 5)}" in txt
@@ -776,7 +776,7 @@ print(rem); assert "Séance à 14:00 : S3 E3 &lt;EF&gt;" in rem and "dans enviro
 assert "🌦️" not in m.build_reminder({"nom": "X"}, start, {"info": "Météo non disponible"}, 30)
 # prompt : heure locale + tableau horaire
 p = m.make_prompt({}, w, [], {"brut_recent": []}, [], "Quel temps dans 1 h ?")
-assert "il est " in p and "MÉTÉO HEURE PAR HEURE" in p and "heure,temp,ressenti,pluie_pct,pluie_mm,vent_kmh\nauj 08h,12,10,5,0,20" in p and "creneaux_favorables_24h" in p and "horaire" not in p.split("MÉTÉO HEURE PAR HEURE")[0].split("MÉTÉO (")[1]
+assert "Heure locale : " in p and "MÉTÉO HEURE PAR HEURE" in p and "heure,temp,ressenti,pluie_pct,pluie_mm,vent_kmh\nauj 08h,12,10,5,0,20" in p and "creneaux_favorables_24h" in p and "horaire" not in p.split("MÉTÉO HEURE PAR HEURE")[0].split("MÉTÉO (")[1]
 
 # ---------------- rappels et relance (sans Gemini)
 sent = []; m.tg_send = lambda cid, text, buttons=None: sent.append(text)
@@ -1462,6 +1462,92 @@ m.requests = Fk(); m.get_all_data = lambda: ({}, {}, [], {"brut_recent": []}, []
 assert "Sauvegarde Telegram : dernière il y a" in m.diagnostic() and "/sauvegarde" in m.HELP_TEXT
 m.db_exec("DELETE FROM kv WHERE k='backup_at'"); assert "aucune pour l'instant" in m.diagnostic()
 print("TEST17 PASSED")
+'''),
+    ('18_audit_gemini', '18_audit_gemini : modifier une séance, texte du coach, W/kg, estimation 5 km, ménage de la base', r'''import sys, importlib.util, os, datetime, json, tempfile, types as _t
+from unittest.mock import MagicMock
+for name in ["google", "google.genai", "google.genai.types", "telegram", "telegram.constants", "telegram.ext"]:
+    sys.modules[name] = MagicMock()
+_err = _t.ModuleType("telegram.error"); _err.Conflict = type("Conflict", (Exception,), {}); sys.modules["telegram.error"] = _err
+os.environ.update(INTERVALS_API_KEY="k", GEMINI_API_KEY="g", TELEGRAM_BOT_TOKEN="t", TELEGRAM_USER_ID="1")
+os.chdir(tempfile.mkdtemp())
+spec = importlib.util.spec_from_file_location("main", os.environ["MAIN_PY"] if "MAIN_PY" in os.environ else os.environ["MAIN_PY"])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m); m.init_db(); m.time.sleep = lambda *_: None
+today = datetime.date.today(); iso = today.isoformat(); D = lambda a: (today - datetime.timedelta(days=a)).isoformat(); F = lambda a: (today + datetime.timedelta(days=a)).isoformat()
+
+# ---------- modifier_seance
+class Resp:
+    def __init__(s, c=200, d=None): s.status_code, s._d, s.text = c, d, "x"
+    def json(s): return s._d
+class Cal:
+    def __init__(s): s.events, s.puts, s.put_code = [], [], 200
+    def get(s, url, **k):
+        p = k["params"]; return Resp(200, [e for e in s.events if p["oldest"] <= e["start_date_local"][:10] <= p["newest"]])
+    def put(s, url, **k):
+        s.puts.append((url.rsplit("/", 1)[1], k["json"]))
+        if s.put_code == 200:
+            for e in s.events:
+                if str(e["id"]) == url.rsplit("/", 1)[1]: e.update(k["json"])
+        return Resp(s.put_code, {})
+cal = Cal(); m.requests = cal; d1, d2 = F(1), F(2)
+cal.events = [{"id": 1, "category": "WORKOUT", "name": "S5 E2 Seuil", "description": "20 min EF\n3 x 6 min seuil\n10 min retour au calme", "start_date_local": d1 + "T18:00:00"}]
+r = m.modifier_seance(d1, description="40 min footing facile 6'30/km"); print(r)
+assert r.startswith("✅ Séance 'S5 E2 Seuil' du " + d1 + " à 18:00 mise à jour.") and "Avant : « S5 E2 Seuil » — 20 min EF" in r
+assert cal.puts[-1] == ("1", {"name": "S5 E2 Seuil", "description": "40 min footing facile 6'30/km", "start_date_local": d1 + "T18:00:00"})
+r = m.modifier_seance(d1, nouveau_titre="S5 E2 Footing", heure="07h30"); assert "07:30 mise à jour" in r and cal.puts[-1][1]["start_date_local"] == d1 + "T07:30:00" and cal.puts[-1][1]["name"] == "S5 E2 Footing"
+n = len(cal.puts); r = m.modifier_seance(d1, description="40 min footing facile 6'30/km"); assert "Rien à modifier" in r and len(cal.puts) == n          # aucun appel inutile
+assert "passé" in m.modifier_seance(D(1), description="x") and "Aucune séance à modifier" in m.modifier_seance(d2, description="x")
+cal.events.append({"id": 2, "category": "WORKOUT", "name": "Renfo", "description": "", "start_date_local": d1 + "T19:00:00"})
+r = m.modifier_seance(d1, description="x"); assert "Plusieurs séances" in r and len(cal.puts) == n + 0 or "Plusieurs séances" in r
+assert "mise à jour" in m.modifier_seance(d1, titre_actuel="renfo", description="gainage 20 min") and cal.puts[-1][0] == "2"
+cal.put_code = 500; assert "refusé la modification (HTTP 500)" in m.modifier_seance(d1, titre_actuel="Footing", description="autre"); cal.put_code = 200
+assert "modifier_seance" in m.TOOLS_MAP and "modifier_seance" in m.SYSTEM_INSTRUCTION
+
+# ---------- le coach garde la parole quand il agit
+class Call:
+    def __init__(s, name, args): s.name, s.args = name, args
+class R:
+    def __init__(s, calls, text): s.function_calls, s.text = calls, text
+client = MagicMock(); m.ai_client = client
+m.TOOLS_MAP["planifier_seance"] = lambda **kw: "✅ Séance 'Footing' planifiée."
+client.models.generate_content.return_value = R([Call("planifier_seance", {"date_str": d1, "titre": "Footing"})], "  Footing facile demain, ça fera du bien aux jambes.  ")
+out = m.generate_ai("x"); assert out == "✅ Séance 'Footing' planifiée.\n\nFooting facile demain, ça fera du bien aux jambes.", repr(out)
+m.TOOLS_MAP["planifier_seance"] = lambda **kw: "⚠️ La séance existe déjà."
+assert m.generate_ai("x") == "⚠️ La séance existe déjà."                                           # jamais de commentaire qui contredit une action ratée
+client.models.generate_content.return_value = R([Call("planifier_seance", {})], ""); assert m.generate_ai("x") == "⚠️ La séance existe déjà."
+
+# ---------- W/kg : la clé réelle est « dyn »
+base = {"well": [{"d": D(a), "weight": 72.0} for a in range(7)], "prof": {}}
+for key in ("dyn", "bio"):
+    line = m._dash_poids(dict(base, details=[{key: {"watts": {"moy": 298}}}])); assert "298 W, soit 4.14 W/kg" in line, (key, line)
+
+# ---------- « s'adapte » n'est pas une demande
+for msg, mode in (("Mon corps s'adapte bien à la charge", "CONVERSATION"), ("Je m'adapte au froid", "CONVERSATION"), ("J'ai modifié mon sommeil", "CONVERSATION"),
+                  ("Adapte ma séance de ce soir en footing 40 min", "PLANIFICATION"), ("Allège la séance de demain", "PLANIFICATION"),
+                  ("Tu peux raccourcir la sortie de jeudi ?", "PLANIFICATION"), ("Modifie la séance de samedi", "PLANIFICATION")):
+    assert m.detect_mode(msg) == mode, (msg, m.detect_mode(msg))
+
+# ---------- coefficient du 5 km selon l'intensité (FC du lap / FC seuil)
+def obj(hr, lthr=172):
+    det = [{"id": "x", "d": D(2), "nom": "VMA", "laps": [{"n": 1, "type": "WORK", "duree_s": 240, "pace": "4'00\"/km", "hr": hr}]}]
+    return m._dash_objectif({"today": today, "acts": {}, "details": det, "prof": {"lthr": lthr} if lthr else {}})
+assert "× 0.95 (effort modéré)" in obj(150) and "× 0.965 (effort proche du seuil)" in obj(168) and "× 1 (effort déjà au niveau d'un 5 km)" in obj(178)
+t = obj(178); assert f"équivalent 5 km estimé : 4'00/km, soit 20'00" in t                         # effort déjà à l'allure 5 km : pas de gain artificiel
+assert "× 0.95 (FC absente, valeur par défaut)" in obj(150, lthr=None) and "× 0.965" in obj(163)
+
+# ---------- ménage de la base
+m.db_exec("INSERT OR REPLACE INTO kv (k, v) VALUES (?, '{}')", ("usage|2026-01-01",)); m.kv_set(f"usage|{iso}", "{}")
+m.db_exec("INSERT INTO followups (due, txt, done, created) VALUES ('2026-01-01', 'vieux', 1, '2026-01-01')"); m.db_exec(f"INSERT INTO followups (due, txt, done, created) VALUES ('{iso}', 'récent', 1, '{iso}')")
+m.db_exec("INSERT INTO followups (due, txt, done, created) VALUES ('2026-01-01', 'attente', 0, '2026-01-01')")
+for i in range(75): m.followup_buttons({"nom": f"S{i}"}, iso)
+assert m.db_exec("SELECT COUNT(*) FROM kv WHERE k LIKE 'cb|%'", fetch=True)[0][0] == 60               # les 60 derniers jetons seulement
+m.init_db()
+assert m.kv_get("usage|2026-01-01") is None and m.kv_get(f"usage|{iso}") == "{}"
+assert [r[0] for r in m.db_exec("SELECT txt FROM followups ORDER BY id", fetch=True)] == ["récent", "attente"]   # ancien suivi clos purgé, suivi en attente conservé
+
+# ---------- heure exacte en fin de prompt (le préfixe météo reste identique, donc relu depuis le cache)
+p = m.make_prompt({}, {"horaire": [{"t": "x", "h": "auj 08h", "temp_c": 12}]}, [], {"brut_recent": []}, [], "Salut")
+assert "il est " not in p and p.index("MÉTÉO HEURE PAR HEURE") < p.index("Heure locale : ") < p.index("MODE DE RÉPONSE")
+print("TEST18 PASSED")
 '''),
 ]
 
