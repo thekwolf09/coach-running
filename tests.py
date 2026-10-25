@@ -1657,20 +1657,20 @@ assert m.db_exec("SELECT COUNT(*) FROM feel_log", fetch=True)[0][0] == 1        
 assert m._dash_reference({"today": today, "recent": [], "prof": {"lthr": 172}}) is None                                              # pas d'activité : pas de test proposé
 
 # ---------- effort perçu saisi sur la montre
-acts_rpe = [{"id": "a", "d": D2(1), "type": "Run", "min": 40.0, "km": 6.0, "rpe": 4, "feel": 2}, {"id": "b", "d": D2(3), "type": "Run", "min": 50.0, "km": 8.0, "rpe": 6, "feel": None},
+acts_rpe = [{"id": "a", "d": D2(1), "type": "Run", "min": 40.0, "km": 6.0, "rpe": 4, "feel": 2, "forme": 4}, {"id": "b", "d": D2(3), "type": "Run", "min": 50.0, "km": 8.0, "rpe": 6, "feel": None},
             {"id": "c", "d": D2(20), "type": "Run", "min": 45.0, "km": 7.0, "rpe": 1}, {"id": "d", "d": D2(5), "type": "Run", "min": 30.0, "km": 4.0}]
 r = m._dash_rpe({"today": today, "recent": acts_rpe}); print(r)
-assert f"{D2(1)} 40.0 min : RPE 4/10, feel 2/5" in r and f"{D2(3)} 50.0 min : RPE 6/10" in r and "RPE moyen sur 7 jours 5.0" in r and "1 = très en forme, 5 = très faible" in r and "valeur par défaut" in r
+assert f"{D2(1)} 40.0 min : RPE 4/10, forme 4/5" in r and f"{D2(3)} 50.0 min : RPE 6/10" in r and "RPE moyen sur 7 jours 5.0" in r and "1 = très fatigué, 5 = très en forme" in r and "valeur par défaut" in r
 assert m._dash_rpe({"today": today, "recent": [{"d": D2(1), "type": "Run"}]}) is None
 class Rsp:
     def __init__(s, c=200, d=None): s.status_code, s._d, s.text = c, d, "x"
     def json(s): return s._d
 class Act:
     def get(s, url, **k): return Rsp(200, [{"id": "a1", "start_date_local": D2(1) + "T07:00:00", "type": "Run", "name": "Footing", "distance": 8000, "moving_time": 2900, "average_speed": 2.7, "icu_rpe": 4, "feel": 2}]) if url.endswith("/activities") else Rsp(404, [])
-m.requests = Act(); fa = m.fetch_activities()["brut_recent"][0]; assert fa["rpe"] == 4 and fa["feel"] == 2
+m.requests = Act(); fa = m.fetch_activities()["brut_recent"][0]; assert fa["rpe"] == 4 and fa["feel"] == 2 and fa["forme"] == 4
 p = m.make_prompt({}, {}, [], {"brut_recent": [dict(fa, nom="Footing", pace="6'10\"/km", hr=140, load=40)]}, [], "Salut")
 tab = p.split("ACTIVITÉS DES")[1].split("\n\n")[0] if "ACTIVITÉS DES" in p else ""
-assert "charge,rpe,feel" in p and "échelle d'Intervals : 1 très en forme" in p and "EFFORT PERÇU SAISI SUR LA MONTRE" in p
+assert "charge,rpe,forme" in p and "forme = ressenti perçu à la montre" in p and "EFFORT PERÇU SAISI SUR LA MONTRE" in p
 m.requests = Act(); fb = m.fetch_activities()["brut_recent"][0]
 p2 = m.make_prompt({}, {}, [], {"brut_recent": [dict(fb, rpe=None, feel=None, nom="Footing", pace="6'10\"/km", hr=140, load=40)]}, [], "Salut"); assert "charge,rpe" not in p2     # aucune colonne vide
 
@@ -1684,6 +1684,69 @@ assert [o[0] for o in order] == ["extraction", "prompt"] and len([o for o in ord
 order.clear(); run_text("Jambes lourdes aujourd'hui mais bonne humeur"); assert [o[0] for o in order] == ["prompt", "extraction"]     # sans douleur : extraction après la réponse
 
 print("TEST19 PASSED")
+'''),
+    ('20_argon', '20_argon : douleur dans un message court, sauvegarde du ressenti, échelle unique, messages vocaux', r'''import sys, importlib.util, os, datetime, json, tempfile, asyncio, types as _t
+from unittest.mock import MagicMock, AsyncMock
+for name in ["google", "google.genai", "google.genai.types", "telegram", "telegram.constants", "telegram.ext"]:
+    sys.modules[name] = MagicMock()
+_err = _t.ModuleType("telegram.error"); _err.Conflict = type("Conflict", (Exception,), {}); sys.modules["telegram.error"] = _err
+os.environ.update(INTERVALS_API_KEY="k", GEMINI_API_KEY="g", TELEGRAM_BOT_TOKEN="t", TELEGRAM_USER_ID="1")
+os.chdir(tempfile.mkdtemp())
+spec = importlib.util.spec_from_file_location("main", os.environ["MAIN_PY"] if "MAIN_PY" in os.environ else os.environ["MAIN_PY"])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m); m.init_db(); m.time.sleep = lambda *_: None
+today = datetime.date.today(); iso = today.isoformat()
+
+# ---------- A. une douleur est extraite même dans un message très court ou une demande de planification
+m.generate_ai = lambda *a, **k: '{"douleur_zone": "genou", "douleur_int": 5}'
+for msg in ("J'ai mal au genou", "Douleur mollet 6/10", "Ça tiraille un peu en fin de sortie dans le mollet", "Une petite tendinite depuis hier",
+            "Décale ma séance de demain, j'ai une gêne au tibia"):
+    assert m.extract_feelings(msg) is not None, msg
+assert m.db_exec("SELECT COUNT(*) FROM feel_log", fetch=True)[0][0] == 5
+assert m.extract_feelings("ok mal") is None and m.extract_feelings("Débrief séance terminée : douleur au mollet") is None   # trop court / message automatique
+assert m.extract_feelings("Décale ma séance à demain, mes jambes sont lourdes") is None                                # sans douleur : règles habituelles
+assert m.extract_feelings("Je suis crevé après ce bloc de travail, jambes lourdes aussi") is not None
+
+# ---------- B. le ressenti déclaré déclenche la sauvegarde Telegram
+sig = m._data_signature(); m.db_exec("INSERT INTO feel_log (d, jambes) VALUES (?, 3)", (iso,)); assert m._data_signature() != sig
+fresh = os.path.join(os.path.dirname(os.path.abspath(m.DB)), "vierge.db"); real = m.DB; m.DB = fresh; m.init_db()
+assert m.db_is_blank() is True; m.db_exec("INSERT INTO feel_log (d, jambes) VALUES (?, 2)", (iso,)); assert m.db_is_blank() is False; m.DB = real
+
+# ---------- C. une seule échelle : 1 = très fatigué ... 5 = très en forme
+assert [m._forme(x) for x in (1, 2, 3, 4, 5)] == [5, 4, 3, 2, 1] and m._forme(0) is None and m._forme(6) is None and m._forme(None) is None and m._forme(True) is None
+class Resp:
+    def __init__(s, c=200, d=None): s.status_code, s._d, s.text = c, d, "x"
+    def json(s): return s._d
+class Act:
+    def get(s, url, **k):
+        mk = lambda i, feel: {"id": i, "start_date_local": iso + "T07:00:00", "type": "Run", "name": "Footing", "distance": 8000, "moving_time": 2900, "average_speed": 2.7, "icu_rpe": 4, "feel": feel}
+        return Resp(200, [mk("a", 1), mk("b", 5), mk("c", None)]) if url.endswith("/activities") else Resp(404, [])
+m.requests = Act(); items = {a["id"]: a for a in m.fetch_activities()["brut_recent"]}
+assert items["a"]["forme"] == 5 and items["b"]["forme"] == 1 and items["c"]["forme"] is None and items["a"]["feel"] == 1       # valeur brute conservée
+r = m._dash_rpe({"today": today, "recent": [dict(items["a"], min=40.0)]}); assert "forme 5/5" in r and "1 = très fatigué, 5 = très en forme" in r and "feel" not in r
+det = m.format_run_details([{"d": iso, "nom": "Footing", "feel": 2, "rpe": 4}]); assert "forme=4/5" in det and "rpe=4" in det and "feel=" not in det
+
+# ---------- D. message vocal : transcription dans la réponse, historique et ressenti alimentés
+sent, heard_calls = [], []
+m.tg_send = lambda cid, text, buttons=None: sent.append(text); m.extract_feelings = lambda msg: heard_calls.append(msg)
+m.get_all_data = lambda: ({}, {}, [], {"brut_recent": []}, [])
+def run_voice(reply):
+    m.generate_ai = lambda contents, *a, **k: (prompts.append(contents), reply)[1]
+    u = MagicMock(); u.effective_user.id = 1; u.effective_chat.id = 42; u.message.voice.file_id = "F"; u.message.voice.mime_type = "audio/ogg"
+    f = MagicMock(); f.download_to_memory = AsyncMock(); cx = MagicMock(); cx.bot.send_chat_action = AsyncMock(); cx.bot.get_file = AsyncMock(return_value=f)
+    async def go():
+        await m.handle_voice(u, cx); await asyncio.sleep(0.15)
+    asyncio.run(go())
+prompts = []
+run_voice("[TRANSCRIPTION] J'ai mal au genou depuis hier soir\nOn lève le pied et on surveille ça.")
+assert "[TRANSCRIPTION] suivi de la transcription fidèle" in prompts[0][0]
+assert sent[-1] == "On lève le pied et on surveille ça." and "TRANSCRIPTION" not in sent[-1]
+assert heard_calls == ["J'ai mal au genou depuis hier soir"]
+assert m.db_exec("SELECT txt FROM chat_history WHERE role='athlete' ORDER BY id DESC LIMIT 1", fetch=True)[0][0] == "[Message vocal] J'ai mal au genou depuis hier soir"
+sent.clear(); heard_calls.clear(); run_voice("Belle sortie, raconte-moi !")                                              # le modèle a oublié la balise : rien ne casse
+assert sent == ["Belle sortie, raconte-moi !"] and heard_calls == []
+sent.clear(); run_voice("✅ Séance décalée.\n\n[TRANSCRIPTION] Décale ma séance à demain\nC'est fait.")                  # balise après un résultat d'outil
+assert "TRANSCRIPTION" not in sent[-1] and "✅ Séance décalée." in sent[-1] and "C'est fait." in sent[-1] and heard_calls == ["Décale ma séance à demain"]
+print("TEST20 PASSED")
 '''),
 ]
 

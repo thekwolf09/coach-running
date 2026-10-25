@@ -1137,7 +1137,12 @@ def parse_feel(text):
 def extract_feelings(msg, today=None):
     """Après une conversation : une petite requête à Gemini (~0,001 $) transforme le récit de sensations en données stockées."""
     msg = (msg or "").strip()
-    if len(msg) < 20 or not FEEL_HINT.search(msg) or detect_mode(msg) not in ("CONVERSATION", "QUESTION", "LIBRE"):
+    pain = bool(PAIN_HINT.search(msg))
+    mode = detect_mode(msg)
+    if pain:
+        if len(msg) < 8 or mode in ("DEBRIEF", "BRIEF", "BILAN", "SUIVI"):
+            return None
+    elif len(msg) < 20 or not FEEL_HINT.search(msg) or mode not in ("CONVERSATION", "QUESTION", "LIBRE"):
         return None
     try:
         raw = generate_ai(f"Message de l'athlète :\n{msg[:1500]}", allow_tools=False, level=THINKING_ROUTINE, system=FEEL_SYSTEM)
@@ -1186,15 +1191,20 @@ def _dash_ressenti(c):
     return "RESSENTI DÉCLARÉ (extrait de tes messages, 7 derniers jours ; 1 = très mal, 5 = très bien) : " + " | ".join(parts)
 
 
+def _forme(f):
+    """Intervals note le « feel » de 1 (en forme) à 5 (très faible) : on l'inverse pour que 5 = très en forme, comme le ressenti déclaré."""
+    return 6 - int(f) if isinstance(f, (int, float)) and not isinstance(f, bool) and 1 <= f <= 5 else None
+
+
 def _dash_rpe(c):
-    rows = [a for a in c["recent"] if a.get("rpe") or a.get("feel")]
+    rows = [a for a in c["recent"] if a.get("rpe") or a.get("forme")]
     if not rows:
         return None
     since = (c["today"] - datetime.timedelta(days=7)).isoformat()
     last7 = [a["rpe"] for a in rows if a.get("rpe") and a["d"] >= since]
-    parts = [f"{a['d']} {a.get('min') or '?'} min : " + ", ".join(x for x in (f"RPE {a['rpe']}/10" if a.get("rpe") else None, f"feel {a['feel']}/5" if a.get("feel") else None) if x)
+    parts = [f"{a['d']} {a.get('min') or '?'} min : " + ", ".join(x for x in (f"RPE {a['rpe']}/10" if a.get("rpe") else None, f"forme {a['forme']}/5" if a.get("forme") else None) if x)
              for a in rows[:5]]
-    t = "EFFORT PERÇU SAISI SUR LA MONTRE (RPE 1 à 10 ; feel : 1 = très en forme, 5 = très faible) : " + " | ".join(parts)
+    t = "EFFORT PERÇU SAISI SUR LA MONTRE (RPE 1 à 10 ; forme : 1 = très fatigué, 5 = très en forme, même sens que le ressenti déclaré) : " + " | ".join(parts)
     if last7:
         t += f" ; RPE moyen sur 7 jours {sum(last7) / len(last7):.1f}"
     return t + " ; un RPE de 1 est souvent la valeur par défaut de la montre : ignore-le s'il contredit l'effort réel"
@@ -1266,6 +1276,7 @@ def fetch_activities():
                 "h": str(a.get("start_date_local") or "")[11:16],
                 "rpe": _num(a.get("icu_rpe"), 0),
                 "feel": _num(a.get("feel"), 0),
+                "forme": _forme(a.get("feel")),
                 "shoes": gear.get("name") if isinstance(gear, dict) else None,
             }
             if a.get("type") in RUN_TYPES and dist >= 3000 and spd > 0:
@@ -2556,7 +2567,7 @@ WELL_COLS = [("d", "d"), ("sommeil_h", "sleep_h"), ("hrv", "hrv"), ("hrv_base", 
              ("vo2max", "vo2max"), ("fatigue", "fatigue"), ("courbatures", "soreness"), ("stress", "stress"),
              ("humeur", "mood"), ("motivation", "motivation"), ("poids_kg", "weight")]
 ACT_COLS = [("d", "d"), ("type", "type"), ("nom", "nom"), ("km", "km"), ("min", "min"), ("allure", "pace"),
-            ("fc", "hr"), ("charge", "load"), ("rpe", "rpe"), ("feel", "feel")]
+            ("fc", "hr"), ("charge", "load"), ("rpe", "rpe"), ("forme", "forme")]
 WEEK_COLS = [("semaine", "semaine"), ("seances", "seances"), ("km", "km_total"), ("h", "temps_h"), ("charge", "charge_totale"),
              ("km_course", "km_course"), ("allure_course", "allure_course"), ("fc_course", "fc_course")]
 TOP_COLS = [("allure", "allure"), ("km", "distance_km"), ("date", "date"), ("nom", "nom")]
@@ -2575,13 +2586,15 @@ def format_run_details(details):
     labels = {"cad": "cad_spm"}
     for d in details or []:
         extras = [f"{labels.get(k, k)}={_cell(d[k])}" for k in ("fc_max", "cad", "d+", "decouplage_pct", "ef", "intensite", "trimp", "temp_c",
-                                                              "rpe", "feel", "gap", "watts_moy", "watts_np", "foulee_m") if d.get(k) is not None]
+                                                              "rpe", "gap", "watts_moy", "watts_np", "foulee_m") if d.get(k) is not None]
         if d.get("temps_zones_fc_s"):
             extras.append("zones_fc_s=" + "/".join(str(x) for x in d["temps_zones_fc_s"]))
         if d.get("pic_fc"):
             extras.append(f"pic_fc={d['pic_fc']['fc']} à la {d['pic_fc']['min']}e min")
         if d.get("chaussures"):
             extras.append("chaussures=" + _cell(d["chaussures"]))
+        if _forme(d.get("feel")):
+            extras.append(f"forme={_forme(d['feel'])}/5")
         if d.get("notes"):
             extras.append("notes=" + _cell(d["notes"]))
         part = [f"## {d.get('d')} {_cell(d.get('nom'))} " + " ".join(extras)]
@@ -2660,7 +2673,7 @@ def make_prompt(prof, weather, well, acts, evts, user_msg, series="auto"):
     if weekly:
         parts.append(_tblock("SANTÉ, moyennes hebdomadaires plus anciennes", weekly, WELL_COLS))
     parts += [
-        _tblock("ACTIVITÉS DES %d DERNIERS JOURS, du plus récent au plus ancien (rpe = effort perçu 1 à 10 saisi sur la montre ; feel = échelle d'Intervals : 1 très en forme, 5 très faible ; colonnes présentes si saisies)" % RAW_DAYS, acts.get("brut_recent"), ACT_COLS, drop_empty=True),
+        _tblock("ACTIVITÉS DES %d DERNIERS JOURS, du plus récent au plus ancien (rpe = effort perçu 1 à 10 saisi sur la montre ; forme = ressenti perçu à la montre, 1 très fatigué à 5 très en forme (même sens que le ressenti déclaré) ; colonnes présentes si saisies)" % RAW_DAYS, acts.get("brut_recent"), ACT_COLS, drop_empty=True),
         "DÉTAIL DES DERNIÈRES COURSES (laps = intervalles de la montre : type WORK/RECOVERY, duree_s, allure, fc moyenne et max, "
         "par_min = allure/fc minute par minute ; km = splits au kilomètre, p = dernier tronçon partiel, d_alt = dénivelé net en m ; "
         "zones_fc_s = secondes par zone de FC) :\n" + (format_run_details(acts.get("detail_dernieres_courses")) or "(indisponible ou vide)"),
@@ -2953,6 +2966,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cid = update.effective_chat.id
     typing = asyncio.create_task(_typing_loop(context.bot, cid, ChatAction.RECORD_VOICE))
     save = True
+    heard = None
     try:
         f = await context.bot.get_file(v.file_id)
         buf = io.BytesIO()
@@ -2962,10 +2976,16 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         prof, weather, well, acts, evts = await asyncio.to_thread(get_all_data)
         text_prompt = await asyncio.to_thread(
             make_prompt, prof, weather, well, acts, evts,
-            "Message vocal de l'athlète (écoute l'audio joint et réponds-y).", False)
+            "Message vocal de l'athlète (écoute l'audio joint et réponds-y). Écris d'abord, sur une seule ligne, [TRANSCRIPTION] suivi de la transcription fidèle du message vocal, puis ta réponse.", False)
         save_chat_msg("athlete", "[Message vocal]")
         contents = [text_prompt, types.Part.from_bytes(data=buf.getvalue(), mime_type=mime)]
         ans = await asyncio.to_thread(generate_ai, contents)
+        mt = re.search(r"\[TRANSCRIPTION\]\s*([^\n]+)\n*", ans)
+        if mt:
+            heard = mt.group(1).strip()
+            ans = (ans[:mt.start()] + ans[mt.end():]).strip() or ans
+            db_exec("UPDATE chat_history SET txt=? WHERE id=(SELECT MAX(id) FROM chat_history WHERE role='athlete' AND txt='[Message vocal]')",
+                    ("[Message vocal] " + heard[:600],))
         ack_alert(well, ans, acts)
         ack_followups(ans)
     except AIError as e:
@@ -2976,6 +2996,8 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     finally:
         await _stop_typing(typing)
     await send_reply(cid, ans, save=save)
+    if heard and save:
+        asyncio.create_task(asyncio.to_thread(extract_feelings, heard))
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3077,7 +3099,7 @@ def _data_signature():
     """Change quand la mémoire durable change (notes, suivis, carnet, historique d'efforts), pas à chaque message."""
     row = db_exec("SELECT (SELECT COUNT(*) FROM notes), (SELECT COALESCE(MAX(id), 0) FROM notes), (SELECT COUNT(*) FROM followups), "
                   "(SELECT COUNT(*) FROM followups WHERE done=1), (SELECT COALESCE(LENGTH(v), 0) FROM kv WHERE k='chat_summary'), "
-                  "(SELECT COUNT(*) FROM efforts)", fetch=True)[0]
+                  "(SELECT COUNT(*) FROM efforts), (SELECT COUNT(*) FROM feel_log)", fetch=True)[0]
     return "-".join(str(x) for x in row)
 
 
@@ -3155,7 +3177,7 @@ def db_is_blank():
     try:
         conn = sqlite3.connect(DB, timeout=5)
         try:
-            n = sum(conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0] for t in ("notes", "chat_history", "followups", "kv"))
+            n = sum(conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0] for t in ("notes", "chat_history", "followups", "kv", "feel_log"))
         finally:
             conn.close()
         return n == 0
@@ -3250,7 +3272,7 @@ async def handle_sauvegarde(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             "✅ Sauvegarde envoyée et épinglée en haut de cette conversation." if ok else "⚠️ Sauvegarde impossible, regarde /etat et les logs.")
 
 
-BUILD = "2026-10-19"
+BUILD = "2026-10-20"
 _OPTIONAL_WELLNESS = ("hrv", "rhr", "sleep_h", "weight", "sleep_score", "readiness", "vo2max", "fatigue", "soreness", "stress", "mood", "motivation")
 
 
